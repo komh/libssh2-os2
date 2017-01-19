@@ -23,6 +23,10 @@
 #include <sys/select.h>
 #endif
 
+#ifdef __OS2__
+typedef int socklen_t;
+#endif
+
 #ifndef INADDR_NONE
 #define INADDR_NONE (in_addr_t)-1
 #endif
