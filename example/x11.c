@@ -26,6 +26,14 @@
 
 #define _PATH_UNIX_X "/tmp/.X11-unix/X%d"
 
+#ifdef __OS2__
+int main( int argc, char *argv[])
+{
+    /* Not supported on OS/2 */
+
+    return 0;
+}
+#else
 /*
  * Chained list that contains channels and associated X11 socket for each X11
  * connections
@@ -463,3 +471,4 @@ main (int argc, char *argv[])
 
     return 0;
 }
+#endif
