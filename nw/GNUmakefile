@@ -1,7 +1,7 @@
 #########################################################################
 #
 ## Makefile for building libssh2 (NetWare version - gnu make)
-## Use: make -f Makefile.netware [help|all|clean|dev|devclean|dist|distclean|lib|nlm|objclean]
+## Use: make [help|all|clean|dev|devclean|dist|distclean|lib|nlm|objclean]
 ##
 ## Hacked by: Guenter Knauf
 #
@@ -14,12 +14,12 @@ endif
 
 # Edit the path below to point to the base of your Zlib sources.
 ifndef ZLIB_PATH
-ZLIB_PATH = ../../zlib-1.2.5
+ZLIB_PATH = ../../zlib-1.2.8
 endif
 
 # Edit the path below to point to the base of your OpenSSL package.
 ifndef OPENSSL_PATH
-OPENSSL_PATH = ../../openssl-0.9.8r
+OPENSSL_PATH = ../../openssl-0.9.8zc
 endif
 
 # Edit the path below to point to your Distribution folder.
@@ -37,8 +37,8 @@ DEVLARC	= $(DEVLDIR).zip
 # Edit the vars below to change NLM target settings.
 TARGET	= libssh2
 VERSION	= $(LIBSSH2_VERSION)
-COPYR	= Copyright (c) $(LIBSSH2_COPYRIGHT_STR)
-WWWURL	= http://www.libssh2.org/
+CPRIGHT	= Copyright (c) $(LIBSSH2_COPYRIGHT_STR)
+WWWURL	= https://www.libssh2.org/
 DESCR	= libssh2 $(LIBSSH2_VERSION_STR) ($(LIBARCH)) - $(WWWURL)
 MTSAFE	= YES
 STACK	= 64000
@@ -76,10 +76,7 @@ ifdef METROWERKS
 else
 	CC = $(CROSSPREFIX)gcc
 endif
-CP	= cp -afv
-MD	= mkdir
-RD	= rm -fr
-# RM	= rm -f
+
 # Here you can find a native Win32 binary of the original awk:
 # http://www.gknw.net/development/prgtools/awk-20100523.zip
 AWK	= awk
@@ -88,6 +85,34 @@ AWK	= awk
 # http://www.gknw.net/development/prgtools/mkxdc.zip
 MPKXDC	= mkxdc
 ZIP	= zip -qzr9
+
+# Platform-dependent helper tool macros
+ifeq ($(findstring /sh,$(SHELL)),/sh)
+DEL	= rm -f $1
+RMDIR	= rm -fr $1
+MKDIR	= mkdir -p $1
+COPY	= -cp -afv $1 $2
+#COPYR	= -cp -afr $1/* $2
+COPYR	= -rsync -aC $1/* $2
+TOUCH	= touch $1
+CAT	= cat
+ECHONL	= echo ""
+DL	= '
+else
+ifeq "$(OS)" "Windows_NT"
+DEL	= -del 2>NUL /q /f $(subst /,\,$1)
+RMDIR	= -rd 2>NUL /q /s $(subst /,\,$1)
+else
+DEL	= -del 2>NUL $(subst /,\,$1)
+RMDIR	= -deltree 2>NUL /y $(subst /,\,$1)
+endif     
+MKDIR	= -md 2>NUL $(subst /,\,$1)
+COPY	= -copy 2>NUL /y $(subst /,\,$1) $(subst /,\,$2)
+COPYR	= -xcopy 2>NUL /q /y /e $(subst /,\,$1) $(subst /,\,$2)
+TOUCH	= copy 2>&1>NUL /b $(subst /,\,$1) +,,
+CAT	= type
+ECHONL	= $(ComSpec) /c echo.
+endif
 
 # LIBARCH_U = $(shell $(AWK) 'BEGIN {print toupper(ARGV[1])}' $(LIBARCH))
 LIBARCH_L = $(shell $(AWK) 'BEGIN {print tolower(ARGV[1])}' $(LIBARCH))
@@ -120,13 +145,14 @@ else
 endif
 else
 LD	= $(CROSSPREFIX)nlmconv
-LDFLAGS	= -T
+LDFLAGS	= -UT
 AR	= $(CROSSPREFIX)ar
 ARFLAGS	= -cq
 LIBEXT	= a
 RANLIB	= $(CROSSPREFIX)ranlib
-CFLAGS  += -m32
-CFLAGS	+= -fno-builtin -fpcc-struct-return -fno-strict-aliasing
+CFLAGS	+= -m32
+CFLAGS	+= -fno-builtin -fpcc-struct-return
+CFLAGS	+= -fno-strict-aliasing
 CFLAGS	+= -Wall # -pedantic
 #CFLAGS	+= -Wno-pointer-sign
 ifeq ($(LIBARCH),LIBC)
@@ -185,14 +211,11 @@ ifdef XDCOPT
 	XDCDATA = $(OBJDIR)/$(TARGET).xdc
 endif
 
-ifeq ($(findstring /sh,$(SHELL)),/sh)
-DL	= '
-DS	= /
-else
-DS	= \\
-endif
-
 vpath %.c . ../src
+
+# only OpenSSL is supported with this build system
+CFLAGS += -DLIBSSH2_OPENSSL
+include ../Makefile.OpenSSL.inc
 
 # include Makefile.inc to get CSOURCES define
 include ../Makefile.inc
@@ -200,7 +223,7 @@ include ../Makefile.inc
 OBJECTS := $(patsubst %.c,%.o,$(CSOURCES))
 ifeq ($(LIBARCH),CLIB)
 # CLIB lacks of snprint() function - here's a replacement:
-# http://www.ijs.si/software/snprintf/
+# https://www.ijs.si/software/snprintf/
 OBJECTS += snprintf.o
 vpath %.c $(SNPRINTF)
 endif
@@ -217,69 +240,74 @@ lib: prebuild $(TARGET).$(LIBEXT)
 prebuild: $(OBJDIR) $(OBJDIR)/version.inc libssh2_config.h
 
 test: all
-	$(MAKE) -C test -f Makefile.netware
+	$(MAKE) -C test
 
 $(OBJDIR)/%.o: %.c
 #	@echo Compiling $<
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(OBJDIR)/version.inc: ../include/libssh2.h $(OBJDIR)
+$(OBJDIR)/version.inc: ../get_ver.awk ../include/libssh2.h $(OBJDIR)
 	@echo Creating $@
-	@$(AWK) -f ../get_ver.awk $< > $@
+	@$(AWK) -f $^ > $@
 
 dist: all $(DISTDIR) $(DISTDIR)/readme.txt
-	@-$(MD) $(DISTDIR)$(DS)bin
-	@-$(CP) ../COPYING $(DISTDIR)
-	@-$(CP) ../INSTALL $(DISTDIR)
-	@-$(CP) ../README $(DISTDIR)
-	@$(CP) $(TARGET).nlm $(DISTDIR)/bin
+	@$(call MKDIR, $(DISTDIR)/bin)
+	@$(call COPY, ../AUTHORS, $(DISTDIR))
+	@$(call COPY, ../COPYING, $(DISTDIR))
+	@$(call COPY, ../INSTALL, $(DISTDIR))
+	@$(call COPY, ../README, $(DISTDIR))
+	@$(call COPY, ../RELEASE-NOTES, $(DISTDIR))
+	@$(call COPY, $(TARGET).nlm, $(DISTDIR)/bin)
 	@echo Creating $(DISTARC)
 	@$(ZIP) $(DISTARC) $(DISTDIR)/* < $(DISTDIR)/readme.txt
 
 dev: all $(DEVLDIR) $(DEVLDIR)/readme.txt
-	@-$(MD) $(DEVLDIR)$(DS)bin
-	@-$(MD) $(DEVLDIR)$(DS)include
-	@-$(MD) $(DEVLDIR)$(DS)nw
-	@-$(CP) ../COPYING $(DISTDIR)
-	@-$(CP) ../INSTALL $(DEVLDIR)
-	@-$(CP) ../README $(DEVLDIR)
-	@$(CP) $(TARGET).nlm $(DEVLDIR)/bin
-	@$(CP) ../include/*.h $(DEVLDIR)/include
-	@$(CP) libssh2_config.h $(DEVLDIR)/include
-	@$(CP) $(TARGET).$(LIBEXT) $(DEVLDIR)/nw
+	@$(call MKDIR, $(DEVLDIR)/bin)
+	@$(call MKDIR, $(DEVLDIR)/include)
+	@$(call MKDIR, $(DEVLDIR)/nw)
+	@$(call COPY, ../AUTHORS, $(DEVLDIR))
+	@$(call COPY, ../COPYING, $(DEVLDIR))
+	@$(call COPY, ../INSTALL, $(DEVLDIR))
+	@$(call COPY, ../README, $(DEVLDIR))
+	@$(call COPY, ../RELEASE-NOTES, $(DEVLDIR))
+	@$(call COPY, ../include/*.h, $(DEVLDIR)/include)
+	@$(call COPY, libssh2_config.h, $(DEVLDIR)/include)
+	@$(call COPY, $(TARGET).nlm, $(DEVLDIR)/bin)
+	@$(call COPY, $(TARGET).imp, $(DEVLDIR)/nw)
+	@$(call COPY, $(TARGET).$(LIBEXT), $(DEVLDIR)/nw)
 	@echo Creating $(DEVLARC)
 	@$(ZIP) $(DEVLARC) $(DEVLDIR)/* < $(DEVLDIR)/readme.txt
 
 distclean: clean
-	-$(RD) $(DISTDIR)
-	-$(RM) $(DISTARC)
+	$(call RMDIR, $(DISTDIR))
+	$(call DEL, $(DISTARC))
 
 devclean: clean
-	-$(RD) $(DEVLDIR)
-	-$(RM) $(DEVLARC)
+	$(call RMDIR, $(DEVLDIR))
+	$(call DEL, $(DEVLARC))
 
 objclean:
-	-$(RD) $(OBJDIR)
+	$(call RMDIR, $(OBJDIR))
 
 testclean: clean
-	$(MAKE) -C test -f Makefile.netware clean
+	$(MAKE) -C test clean
 
 clean: objclean
-	-$(RM) libssh2_config.h
-	-$(RM) $(TARGET).nlm $(TARGET).$(LIBEXT) $(TARGET).imp
+	$(call DEL, libssh2_config.h)
+	$(call DEL, $(TARGET).*)
 
 $(OBJDIR):
-	@$(MD) $@
+	@$(call MKDIR, $@)
 
 $(DISTDIR):
-	@$(MD) $@
+	@$(call MKDIR, $@)
 
 $(DEVLDIR):
-	@$(MD) $@
+	@$(call MKDIR, $@)
 
 $(TARGET).$(LIBEXT): $(OBJS)
 	@echo Creating $@
-	@-$(RM) $@
+	@$(call DEL, $@)
 	@$(AR) $(ARFLAGS) $@ $^
 ifdef RANLIB
 	@$(RANLIB) $@
@@ -287,19 +315,19 @@ endif
 
 $(TARGET).nlm: $(OBJDIR)/$(TARGET).def $(TARGET).imp $(OBJL) $(XDCDATA)
 	@echo Linking $@
-	@-$(RM) $@
+	@$(call DEL, $@)
 	@$(LD) $(LDFLAGS) $<
 
-$(OBJDIR)/%.xdc: Makefile.netware
+$(OBJDIR)/%.xdc: GNUmakefile
 	@echo Creating $@
 	@$(MPKXDC) $(XDCOPT) $@
 
-$(OBJDIR)/%.def: Makefile.netware
+$(OBJDIR)/%.def: GNUmakefile
 	@echo $(DL)# DEF file for linking with $(LD)$(DL) > $@
 	@echo $(DL)# Do not edit this file - it is created by make!$(DL) >> $@
 	@echo $(DL)# All your changes will be lost!!$(DL) >> $@
 	@echo $(DL)#$(DL) >> $@
-	@echo $(DL)copyright "$(COPYR)"$(DL) >> $@
+	@echo $(DL)copyright "$(CPRIGHT)"$(DL) >> $@
 	@echo $(DL)description "$(DESCR)"$(DL) >> $@
 	@echo $(DL)version $(VERSION)$(DL) >> $@
 ifdef NLMTYPE
@@ -353,14 +381,14 @@ ifeq ($(LD),nlmconv)
 	@echo $(DL)output $(TARGET).nlm$(DL) >> $@
 endif
 
-libssh2_config.h: Makefile.netware
+libssh2_config.h: GNUmakefile
 	@echo Creating $@
 	@echo $(DL)/* $@ for NetWare target.$(DL) > $@
 	@echo $(DL)** Do not edit this file - it is created by make!$(DL) >> $@
 	@echo $(DL)** All your changes will be lost!!$(DL) >> $@
 	@echo $(DL)*/$(DL) >> $@
 	@echo $(DL)#define VERSION "$(LIBSSH2_VERSION_STR)"$(DL) >> $@
-	@echo $(DL)#define PACKAGE_BUGREPORT "http://sourceforge.net/projects/libssh2"$(DL) >> $@
+	@echo $(DL)#define PACKAGE_BUGREPORT "https://github.com/libssh2/libssh2/issues"$(DL) >> $@
 ifeq ($(LIBARCH),CLIB)
 	@echo $(DL)#define OS "i586-pc-clib-NetWare"$(DL) >> $@
 	@echo $(DL)#define NETDB_USE_INTERNET 1$(DL) >> $@
@@ -479,7 +507,7 @@ ifeq ($(DB),DEBUG)
 	@echo $(DL)#define LIBSSH2_DEBUG_USERAUTH 1$(DL) >> $@
 endif
 
-libssh2.imp: Makefile.netware
+libssh2.imp: GNUmakefile
 	@echo Creating $@
 	@echo $(DL)# $@ for NetWare target.$(DL) > $@
 	@echo $(DL)# Do not edit this file - it is created by make!$(DL) >> $@
@@ -506,21 +534,26 @@ endif
 	@echo $(DL)  libssh2_channel_wait_closed,$(DL) >> $@
 	@echo $(DL)  libssh2_channel_wait_eof,$(DL) >> $@
 	@echo $(DL)  libssh2_channel_write_ex,$(DL) >> $@
+	@echo $(DL)  libssh2_exit,$(DL) >> $@
 	@echo $(DL)  libssh2_hostkey_hash,$(DL) >> $@
-	@echo $(DL)  libssh2_scp_recv,$(DL) >> $@
-	@echo $(DL)  libssh2_scp_send64,$(DL) >> $@
-	@echo $(DL)  libssh2_scp_send_ex,$(DL) >> $@
+	@echo $(DL)  libssh2_init,$(DL) >> $@
 	@echo $(DL)  libssh2_knownhost_add,$(DL) >> $@
 	@echo $(DL)  libssh2_knownhost_check,$(DL) >> $@
+	@echo $(DL)  libssh2_knownhost_checkp,$(DL) >> $@
 	@echo $(DL)  libssh2_knownhost_free,$(DL) >> $@
 	@echo $(DL)  libssh2_knownhost_init,$(DL) >> $@
 	@echo $(DL)  libssh2_knownhost_readfile,$(DL) >> $@
 	@echo $(DL)  libssh2_knownhost_writefile,$(DL) >> $@
+	@echo $(DL)  libssh2_scp_recv,$(DL) >> $@
+	@echo $(DL)  libssh2_scp_recv2,$(DL) >> $@
+	@echo $(DL)  libssh2_scp_send64,$(DL) >> $@
+	@echo $(DL)  libssh2_scp_send_ex,$(DL) >> $@
 	@echo $(DL)  libssh2_session_abstract,$(DL) >> $@
 	@echo $(DL)  libssh2_session_block_directions,$(DL) >> $@
 	@echo $(DL)  libssh2_session_callback_set,$(DL) >> $@
 	@echo $(DL)  libssh2_session_disconnect_ex,$(DL) >> $@
 	@echo $(DL)  libssh2_session_free,$(DL) >> $@
+	@echo $(DL)  libssh2_session_handshake,$(DL) >> $@
 	@echo $(DL)  libssh2_session_hostkey,$(DL) >> $@
 	@echo $(DL)  libssh2_session_init_ex,$(DL) >> $@
 	@echo $(DL)  libssh2_session_last_errno,$(DL) >> $@
@@ -552,9 +585,10 @@ endif
 	@echo $(DL)  libssh2_userauth_keyboard_interactive_ex,$(DL) >> $@
 	@echo $(DL)  libssh2_userauth_list,$(DL) >> $@
 	@echo $(DL)  libssh2_userauth_password_ex,$(DL) >> $@
-	@echo $(DL)  libssh2_userauth_publickey_fromfile_ex$(DL) >> $@
+	@echo $(DL)  libssh2_userauth_publickey_fromfile_ex,$(DL) >> $@
+	@echo $(DL)  libssh2_version$(DL) >> $@
 
-$(DISTDIR)/readme.txt: Makefile.netware
+$(DISTDIR)/readme.txt: GNUmakefile
 	@echo Creating $@
 	@echo $(DL)This is a binary distribution for NetWare platform.$(DL) > $@
 	@echo $(DL)libssh2 version $(LIBSSH2_VERSION_STR)$(DL) >> $@
@@ -562,11 +596,11 @@ $(DISTDIR)/readme.txt: Makefile.netware
 	@echo $(DL)any further documentation:$(DL) >> $@
 	@echo $(DL)$(WWWURL)$(DL) >> $@
 
-$(DEVLDIR)/readme.txt: Makefile.netware
+$(DEVLDIR)/readme.txt: GNUmakefile
 	@echo Creating $@
 	@echo $(DL)This is a development distribution for NetWare platform.$(DL) > $@
 	@echo $(DL)libssh2 version $(LIBSSH2_VERSION_STR)$(DL) >> $@
-	@echo $(DL)Please download the complete libssh package for$(DL) >> $@
+	@echo $(DL)Please download the complete libssh2 package for$(DL) >> $@
 	@echo $(DL)any further documentation:$(DL) >> $@
 	@echo $(DL)$(WWWURL)$(DL) >> $@
 

@@ -10,6 +10,7 @@
 #include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -48,13 +49,13 @@ static void remove_node(struct chan_X11_list *elem)
     current_node = gp_x11_chan;
 
     if (gp_x11_chan == elem) {
-        /* Removing the only one element in the list */
-        free(gp_x11_chan);
-        gp_x11_chan = NULL;
+        gp_x11_chan = gp_x11_chan->next;
+        free(current_node);
+        return;
     }
 
-    while( current_node->next != NULL) {
-        if (current_node->next ==elem) {
+    while (current_node->next != NULL) {
+        if (current_node->next == elem) {
             current_node->next = current_node->next->next;
             current_node = current_node->next;
             free(current_node);
@@ -79,7 +80,12 @@ static int _raw_mode(void)
     rc = tcgetattr(fileno(stdin), &tio);
     if (rc != -1) {
         _saved_tio = tio;
-        cfmakeraw(&tio);
+        /* do the equivalent of cfmakeraw() manually, to build on Solaris */
+        tio.c_iflag &= ~(IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL|IXON);
+        tio.c_oflag &= ~OPOST;
+        tio.c_lflag &= ~(ECHO|ECHONL|ICANON|ISIG|IEXTEN);
+        tio.c_cflag &= ~(CSIZE|PARENB);
+        tio.c_cflag |= CS8;
         rc = tcsetattr(fileno(stdin), TCSADRAIN, &tio);
     }
     return rc;
@@ -203,25 +209,28 @@ static int x11_send_receive(LIBSSH2_CHANNEL *channel, int sock)
 
     rc = libssh2_poll(fds, nfds, 0);
     if (rc >0) {
-        rc = libssh2_channel_read(channel, buf,sizeof(buf));
-        rc = write(sock, buf, rc);
+        rc = libssh2_channel_read(channel, buf, bufsize);
+        write(sock, buf, rc);
     }
 
-    rc = select(sock+1,&set,NULL,NULL,&timeval_out);
+    rc = select(sock+1, &set, NULL, NULL, &timeval_out);
     if (rc > 0) {
-        memset((void *)buf,0,bufsize);
+        memset((void *)buf, 0, bufsize);
 
         /* Data in sock*/
-        rc = read(sock, buf,sizeof(buf));
-        if (rc > 0)
-            rc = libssh2_channel_write(channel,buf, rc);
-        else
+        rc = read(sock, buf, bufsize);
+        if (rc > 0) {
+            libssh2_channel_write(channel, buf, rc);
+        }
+        else {
+            free(buf);
             return -1;
+        }
     }
 
     free(fds);
     free(buf);
-    if (libssh2_channel_eof (channel) == 1) {
+    if (libssh2_channel_eof(channel) == 1) {
         return -1;
     }
     return 0;
@@ -284,6 +293,10 @@ main (int argc, char *argv[])
     }
 
     sock = socket (AF_INET, SOCK_STREAM, 0);
+    if (sock == -1) {
+        perror("socket");
+        return -1;
+    }
 
     sin.sin_family = AF_INET;
     sin.sin_port = htons (22);
@@ -364,6 +377,9 @@ main (int argc, char *argv[])
         return -1;
     }
 
+    memset(&w_size, 0, sizeof(struct winsize));
+    memset(&w_size_bck, 0, sizeof(struct winsize));
+
     while (1) {
 
         FD_ZERO(&set);
@@ -395,7 +411,7 @@ main (int argc, char *argv[])
 
         rc = libssh2_poll(fds, nfds, 0);
         if (rc >0) {
-            rc = libssh2_channel_read(channel, buf,sizeof(buf));
+            libssh2_channel_read(channel, buf, sizeof(buf));
             fprintf(stdout, "%s", buf);
             fflush(stdout);
         }

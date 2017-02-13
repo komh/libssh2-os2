@@ -38,10 +38,24 @@
 #ifndef LIBSSH2_CRYPTO_H
 #define LIBSSH2_CRYPTO_H
 
+#ifdef LIBSSH2_OPENSSL
+#include "openssl.h"
+#endif
+
 #ifdef LIBSSH2_LIBGCRYPT
 #include "libgcrypt.h"
-#else
-#include "openssl.h"
+#endif
+
+#ifdef LIBSSH2_WINCNG
+#include "wincng.h"
+#endif
+
+#ifdef LIBSSH2_OS400QC3
+#include "os400qc3.h"
+#endif
+
+#ifdef LIBSSH2_MBEDTLS
+#include "mbedtls.h"
 #endif
 
 int _libssh2_rsa_new(libssh2_rsa_ctx ** rsa,
@@ -74,7 +88,12 @@ int _libssh2_rsa_sha1_sign(LIBSSH2_SESSION * session,
                            size_t hash_len,
                            unsigned char **signature,
                            size_t *signature_len);
+int _libssh2_rsa_new_private_frommemory(libssh2_rsa_ctx ** rsa,
+                                        LIBSSH2_SESSION * session,
+                                        const char *filedata, size_t filedata_len,
+                                        unsigned const char *passphrase);
 
+#if LIBSSH2_DSA
 int _libssh2_dsa_new(libssh2_dsa_ctx ** dsa,
                      const unsigned char *pdata,
                      unsigned long plen,
@@ -95,6 +114,11 @@ int _libssh2_dsa_sha1_verify(libssh2_dsa_ctx * dsactx,
 int _libssh2_dsa_sha1_sign(libssh2_dsa_ctx * dsactx,
                            const unsigned char *hash,
                            unsigned long hash_len, unsigned char *sig);
+int _libssh2_dsa_new_private_frommemory(libssh2_dsa_ctx ** dsa,
+                                        LIBSSH2_SESSION * session,
+                                        const char *filedata, size_t filedata_len,
+                                        unsigned const char *passphrase);
+#endif
 
 int _libssh2_cipher_init(_libssh2_cipher_ctx * h,
                          _libssh2_cipher_type(algo),
@@ -103,7 +127,7 @@ int _libssh2_cipher_init(_libssh2_cipher_ctx * h,
 
 int _libssh2_cipher_crypt(_libssh2_cipher_ctx * ctx,
                           _libssh2_cipher_type(algo),
-                          int encrypt, unsigned char *block);
+                          int encrypt, unsigned char *block, size_t blocksize);
 
 int _libssh2_pub_priv_keyfile(LIBSSH2_SESSION *session,
                               unsigned char **method,
@@ -112,6 +136,14 @@ int _libssh2_pub_priv_keyfile(LIBSSH2_SESSION *session,
                               size_t *pubkeydata_len,
                               const char *privatekey,
                               const char *passphrase);
+int _libssh2_pub_priv_keyfilememory(LIBSSH2_SESSION *session,
+                                    unsigned char **method,
+                                    size_t *method_len,
+                                    unsigned char **pubkeydata,
+                                    size_t *pubkeydata_len,
+                                    const char *privatekeydata,
+                                    size_t privatekeydata_len,
+                                    const char *passphrase);
 
 void _libssh2_init_aes_ctr(void);
 

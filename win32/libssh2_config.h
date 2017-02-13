@@ -15,13 +15,16 @@
 #define HAVE_UNISTD_H
 #define HAVE_INTTYPES_H
 #define HAVE_SYS_TIME_H
-#endif
+#define HAVE_GETTIMEOFDAY
+#endif /* __MINGW32__ */
 
+#define HAVE_LIBCRYPT32
 #define HAVE_WINSOCK2_H
 #define HAVE_IOCTLSOCKET
 #define HAVE_SELECT
 
 #ifdef _MSC_VER
+#if _MSC_VER < 1900
 #define snprintf _snprintf
 #if _MSC_VER < 1500
 #define vsnprintf _vsnprintf
@@ -29,13 +32,13 @@
 #define strdup _strdup
 #define strncasecmp _strnicmp
 #define strcasecmp _stricmp
+#endif
 #else
+#ifndef __MINGW32__
 #define strncasecmp strnicmp
 #define strcasecmp stricmp
+#endif /* __MINGW32__ */
 #endif /* _MSC_VER */
-
-/* Compile in zlib support */
-#define LIBSSH2_HAVE_ZLIB 1
 
 /* Enable newer diffie-hellman-group-exchange-sha1 syntax */
 #define LIBSSH2_DH_GEX_NEW 1

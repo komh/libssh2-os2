@@ -1,6 +1,9 @@
 AUTOMAKE_OPTIONS = foreign nostdinc
 
-SUBDIRS = src example tests docs
+SUBDIRS = src tests docs
+if BUILD_EXAMPLES
+SUBDIRS += example
+endif
 
 pkgconfigdir = $(libdir)/pkgconfig
 pkgconfig_DATA = libssh2.pc
@@ -11,10 +14,9 @@ include_HEADERS =			\
 	include/libssh2_sftp.h
 
 NETWAREFILES =  nw/keepscreen.c \
- nw/Makefile \
- nw/Makefile.netware \
- nw/nwlib.c \
- nw/test/Makefile.netware
+	nw/nwlib.c \
+	nw/GNUmakefile \
+	nw/test/GNUmakefile
 
 DSP = win32/libssh2.dsp
 VCPROJ = win32/libssh2.vcproj
@@ -30,8 +32,20 @@ win32/libssh2_config.h win32/config.mk win32/rules.mk		\
 win32/Makefile.Watcom win32/libssh2.dsw win32/tests.dsp $(DSP)	\
 win32/msvcproj.head win32/msvcproj.foot win32/libssh2.rc
 
-EXTRA_DIST = $(WIN32FILES) buildconf $(NETWAREFILES) get_ver.awk HACKING \
- maketgz NMakefile TODO RELEASE-NOTES libssh2.pc.in $(VMSFILES)
+OS400FILES = os400/README400 os400/initscript.sh os400/make.sh		\
+os400/make-src.sh os400/make-rpg.sh os400/make-include.sh		\
+os400/os400sys.c os400/ccsid.c						\
+os400/libssh2_config.h os400/macros.h os400/libssh2_ccsid.h		\
+os400/include/alloca.h os400/include/sys/socket.h os400/include/stdio.h	\
+os400/libssh2rpg/libssh2.rpgle.in					\
+os400/libssh2rpg/libssh2_ccsid.rpgle.in					\
+os400/libssh2rpg/libssh2_publickey.rpgle				\
+os400/libssh2rpg/libssh2_sftp.rpgle					\
+Makefile.os400qc3.inc
+
+EXTRA_DIST = $(WIN32FILES) buildconf $(NETWAREFILES) get_ver.awk \
+ maketgz NMakefile RELEASE-NOTES libssh2.pc.in $(VMSFILES) config.rpath \
+ CMakeLists.txt cmake $(OS400FILES)
 
 ACLOCAL_AMFLAGS = -I m4
 
@@ -73,6 +87,9 @@ gen-coverage:
 coverage: init-coverage build-coverage gen-coverage
 
 # DSP/VCPROJ generation adapted from libcurl
+# only OpenSSL and WinCNG are supported with this build system
+CRYPTO_CSOURCES = openssl.c wincng.c mbedtls.c
+CRYPTO_HHEADERS = openssl.h wincng.h mbedtls.h
 # Makefile.inc provides the CSOURCES and HHEADERS defines
 include Makefile.inc
 

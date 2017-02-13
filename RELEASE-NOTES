@@ -1,30 +1,31 @@
-libssh2 1.4.0
+libssh2 1.8.0
 
 This release includes the following changes:
 
- o Added libssh2_session_supported_algs()
- o Added libssh2_session_banner_get()
- o Added libssh2_sftp_get_channel()
- o libssh2.h: bump the default window size to 256K
+ o added a basic dockerised test suite
+ o crypto: add support for the mbedTLS backend
 
 This release includes the following bugfixes:
 
- o sftp-seek: clear EOF flag
- o userauth: Provide more informations if ssh pub key extraction fails
- o ssh2_exec: skip error outputs for EAGAIN
- o LIBSSH2_SFTP_PACKET_MAXLEN: increase to 80000
- o knownhost_check(): Don't dereference ext if NULL is passed
- o knownhost_add: Avoid dereferencing uninitialized memory on error path
- o OpenSSL EVP: fix threaded use of structs
- o _libssh2_channel_read: react on errors from receive_window_adjust
- o sftp_read: cap the read ahead maximum amount
- o _libssh2_channel_read: fix non-blocking window adjusting
-
+ o libgcrypt: fixed a NULL pointer dereference on OOM
+ o VMS: can't use %zd for off_t format
+ o VMS: update vms/libssh2_config.h
+ o windows: link with crypt32.lib
+ o libssh2_channel_open: speeling error fixed in channel error message
+ o msvc: fixed 14 compilation warnings
+ o tests: HAVE_NETINET_IN_H was not defined correctly
+ o openssl: add OpenSSL 1.1.0 compatibility
+ o cmake: Add CLEAR_MEMORY option, analogously to that for autoconf
+ o configure: make the --with-* options override the OpenSSL default
+ o libssh2_wait_socket: set err_msg on errors
+ o libssh2_wait_socket: Fix comparison with api_timeout to use milliseconds
+ 
 This release would not have looked like this without help, code, reports and
 advice from friends like these:
 
- Gellule Xg, Jernej Kovacic, Peter Krempa, Vincent Torri, Kamil Dudka,
- Peter Stuge, Guenter Knauf, John Engstrom, Alexander Lamaison,
- Mikhail Gusarov
- 
+  Alexander Lamaison, Antenore Gatta, Brad Harder, Charles Collicutt,
+  Craig A. Berry, Dan Fandrich, Daniel Stenberg, Kamil Dudka, Keno Fischer,
+  Taylor Holberton, Viktor Szakats, Will Cosgrove, Zenju
+  (12 contributors)
+
         Thanks! (and sorry if I forgot to mention someone)

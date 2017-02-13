@@ -2,8 +2,9 @@
 AC_INIT(libssh2, [-], libssh2-devel@cool.haxx.se)
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_SRCDIR([src])
-AM_CONFIG_HEADER([src/libssh2_config.h example/libssh2_config.h])
+AC_CONFIG_HEADERS([src/libssh2_config.h example/libssh2_config.h])
 AM_MAINTAINER_MODE
+m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 
 dnl SED is needed by some of the tools
 AC_PATH_PROG( SED, sed, sed-was-not-found-by-configure,
@@ -82,55 +83,83 @@ AC_C_BIGENDIAN
 dnl check for how to do large files
 AC_SYS_LARGEFILE
 
+found_crypto=none
+
 # Configure parameters
-AC_ARG_WITH(libgcrypt,
-  AC_HELP_STRING([--with-libgcrypt],[Use Libgcrypt for crypto]),
-  use_libgcrypt=$withval,use_libgcrypt=auto)
 AC_ARG_WITH(openssl,
   AC_HELP_STRING([--with-openssl],[Use OpenSSL for crypto]),
   use_openssl=$withval,use_openssl=auto)
+AC_ARG_WITH(libgcrypt,
+  AC_HELP_STRING([--with-libgcrypt],[Use libgcrypt for crypto]),
+  [ use_libgcrypt=$withval
+    LIBSSH2_CHECKFOR_GCRYPT
+  ], use_libgcrypt=auto)
+AC_ARG_WITH(wincng,
+  AC_HELP_STRING([--with-wincng],[Use Windows CNG for crypto]),
+  [ use_wincng=$withval
+    LIBSSH2_CHECKFOR_WINCNG
+  ] ,use_wincng=auto)
+AC_ARG_WITH([mbedtls],
+  AC_HELP_STRING([--with-mbedtls],[Use mbedTLS for crypto]),
+  [ use_mbedtls=$withval
+    LIBSSH2_CHECKFOR_MBEDTLS
+  ], use_mbedtls=auto
+)
 AC_ARG_WITH(libz,
-  AC_HELP_STRING([--with-libz],[Use Libz for compression]),
+  AC_HELP_STRING([--with-libz],[Use zlib for compression]),
   use_libz=$withval,use_libz=auto)
 
-# Look for OpenSSL (default)
-if test "$use_openssl" != "no" && test "$use_libgcrypt" != "yes"; then
+support_clear_memory=no
+
+# Look for OpenSSL
+if test "$found_crypto" = "none" && test "$use_openssl" != "no"; then
   AC_LIB_HAVE_LINKFLAGS([ssl], [crypto], [#include <openssl/ssl.h>])
 fi
-
-# Look for libgcrypt
-if test "$ac_cv_libssl" != "yes" && test "$use_libgcrypt" != "no"; then
-  AC_LIB_HAVE_LINKFLAGS([gcrypt], [], [#include <gcrypt.h>])
-fi
-
-if test "$ac_cv_libssl" != "yes" && test "$ac_cv_libgcrypt" != "yes"; then
-  AC_MSG_ERROR([cannot find OpenSSL or Libgcrypt,
-try --with-libssl-prefix=PATH or --with-libgcrypt-prefix=PATH])
-fi
-
-if test "$ac_cv_libgcrypt" = "yes"; then
-  AC_DEFINE(LIBSSH2_LIBGCRYPT, 1, [Use libgcrypt])
-fi
-AM_CONDITIONAL(LIBGCRYPT, test "$ac_cv_libgcrypt" = "yes")
-
-# Not all OpenSSL have AES-CTR functions.
 if test "$ac_cv_libssl" = "yes"; then
-  save_LDFLAGS="$LDFLAGS"
-  LDFLAGS="$LDFLAGS $LIBSSL"
+  AC_DEFINE(LIBSSH2_OPENSSL, 1, [Use OpenSSL])
+  LIBSREQUIRED=libssl,libcrypto
+
+  # Not all OpenSSL have AES-CTR functions.
+  save_LIBS="$LIBS"
+  LIBS="$LIBS $LIBSSL"
   AC_CHECK_FUNCS(EVP_aes_128_ctr)
-  LDFLAGS="$save_LDFLAGS"
+  LIBS="$save_LIBS"
+
+  found_crypto="OpenSSL (AES-CTR: ${ac_cv_func_EVP_aes_128_ctr:-N/A})"
+fi
+
+AM_CONDITIONAL(OPENSSL, test "$ac_cv_libssl" = "yes")
+AM_CONDITIONAL(WINCNG, test "$ac_cv_libbcrypt" = "yes")
+AM_CONDITIONAL(LIBGCRYPT, test "$ac_cv_libgcrypt" = "yes")
+AM_CONDITIONAL(MBEDTLS, test "$ac_cv_libmbedtls" = "yes")
+AM_CONDITIONAL(OS400QC3, false)
+
+# Check if crypto library was found
+if test "$found_crypto" = "none"; then
+  AC_MSG_ERROR([No crypto library found!
+Try --with-libssl-prefix=PATH
+ or --with-libgcrypt-prefix=PATH
+ or --with-libmbedtls-prefix=PATH
+ or --with-wincng on Windows\
+])
 fi
 
 # Look for Libz
 if test "$use_libz" != "no"; then
   AC_LIB_HAVE_LINKFLAGS([z], [], [#include <zlib.h>])
   if test "$ac_cv_libz" != yes; then
-    AC_MSG_NOTICE([Cannot find libz, disabling compression])
+    AC_MSG_NOTICE([Cannot find zlib, disabling compression])
     AC_MSG_NOTICE([Try --with-libz-prefix=PATH if you know you have it])
   else
     AC_DEFINE(LIBSSH2_HAVE_ZLIB, 1, [Compile in zlib support])
+    if test "${LIBSREQUIRED}" != ""; then
+      LIBSREQUIRED="${LIBSREQUIRED},"
+    fi
+    LIBSREQUIRED="${LIBSREQUIRED}zlib"
   fi
 fi
+
+AC_SUBST(LIBSREQUIRED)
 
 #
 # Optional Settings
@@ -148,6 +177,30 @@ AC_ARG_ENABLE(gex-new,
   [GEX_NEW=$enableval])
 if test "$GEX_NEW" != "no"; then
   AC_DEFINE(LIBSSH2_DH_GEX_NEW, 1, [Enable newer diffie-hellman-group-exchange-sha1 syntax])
+fi
+
+AC_ARG_ENABLE(clear-memory,
+  AC_HELP_STRING([--disable-clear-memory],[Disable clearing of memory before being freed]),
+  [CLEAR_MEMORY=$enableval])
+if test "$CLEAR_MEMORY" != "no"; then
+  if test "$support_clear_memory" = "yes"; then
+    AC_DEFINE(LIBSSH2_CLEAR_MEMORY, 1, [Enable clearing of memory before being freed])
+    enable_clear_memory=yes
+  else
+    if test "$CLEAR_MEMORY" = "yes"; then
+      AC_MSG_ERROR([secure clearing/zeroing of memory is not supported by the selected crypto backend])
+    else
+      AC_MSG_WARN([secure clearing/zeroing of memory is not supported by the selected crypto backend])
+    fi
+    enable_clear_memory=unsupported
+  fi
+else
+  if test "$support_clear_memory" = "yes"; then
+    enable_clear_memory=no
+  else
+    AC_MSG_WARN([secure clearing/zeroing of memory is not supported by the selected crypto backend])
+    enable_clear_memory=unsupported
+  fi
 fi
 
 dnl ************************************************************
@@ -215,12 +268,29 @@ AC_HELP_STRING([--disable-hidden-symbols],[Leave all symbols with default visibi
        AC_MSG_RESULT(no)
 )
 
+# Build example applications?
+AC_MSG_CHECKING([whether to build example applications])
+AC_ARG_ENABLE([examples-build],
+AC_HELP_STRING([--enable-examples-build], [Build example applications (this is the default)])
+AC_HELP_STRING([--disable-examples-build], [Do not build example applications]),
+[case "$enableval" in
+  no | false)
+    build_examples='no'
+    ;;
+  *)
+    build_examples='yes'
+    ;;
+esac], [build_examples='yes'])
+AC_MSG_RESULT($build_examples)
+AM_CONDITIONAL([BUILD_EXAMPLES], [test "x$build_examples" != "xno"])
+
 # Checks for header files.
 # AC_HEADER_STDC
 AC_CHECK_HEADERS([errno.h fcntl.h stdio.h stdlib.h unistd.h sys/uio.h])
 AC_CHECK_HEADERS([sys/select.h sys/socket.h sys/ioctl.h sys/time.h])
 AC_CHECK_HEADERS([arpa/inet.h netinet/in.h])
-AC_CHECK_HEADERS([sys/un.h])
+AC_CHECK_HEADERS([sys/un.h], [have_sys_un_h=yes], [have_sys_un_h=no])
+AM_CONDITIONAL([HAVE_SYS_UN_H], test "x$have_sys_un_h" = xyes)
 
 case $host in
   *-*-cygwin* | *-*-cegcc*)
@@ -297,8 +367,10 @@ AC_MSG_NOTICE([summary of build options:
   Compiler:         ${CC}
   Compiler flags:   ${CFLAGS}
   Library types:    Shared=${enable_shared}, Static=${enable_static}
-  Crypto library:   openssl: ${ac_cv_libssl:-no} (AES-CTR: ${ac_cv_func_EVP_aes_128_ctr:-N/A}) libgcrypt: ${ac_cv_libgcrypt:-no}
+  Crypto library:   ${found_crypto}
+  Clear memory:     $enable_clear_memory
   Debug build:      $enable_debug
+  Build examples:   $build_examples
   Path to sshd:     $ac_cv_path_SSHD (only for self-tests)
-  libz compression: $ac_cv_libz
+  zlib compression: $ac_cv_libz
 ])

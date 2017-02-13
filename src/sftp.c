@@ -1,6 +1,6 @@
 /* Copyright (c) 2004-2008, Sara Golemon <sarag@libssh2.org>
  * Copyright (c) 2007 Eli Fant <elifantu@mail.ru>
- * Copyright (c) 2009-2011 by Daniel Stenberg
+ * Copyright (c) 2009-2014 by Daniel Stenberg
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms,
@@ -93,7 +93,6 @@
    some kind of server problem. */
 #define LIBSSH2_SFTP_PACKET_MAXLEN  80000
 
-static int sftp_close_handle(LIBSSH2_SFTP_HANDLE *handle);
 static int sftp_packet_ask(LIBSSH2_SFTP *sftp, unsigned char packet_type,
                            uint32_t request_id, unsigned char **data,
                            size_t *data_len);
@@ -109,7 +108,7 @@ static int sftp_attrsize(unsigned long flags)
             ((flags & LIBSSH2_SFTP_ATTR_UIDGID) ? 8 : 0) +
             ((flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) ? 4 : 0) +
             ((flags & LIBSSH2_SFTP_ATTR_ACMODTIME) ? 8 : 0));
-                                                /* atime + mtime as u32 */
+    /* atime + mtime as u32 */
 }
 
 /* _libssh2_store_u64
@@ -133,6 +132,66 @@ static void _libssh2_store_u64(unsigned char **ptr, libssh2_uint64_t value)
 }
 
 /*
+ * Search list of zombied FXP_READ request IDs.
+ *
+ * Returns NULL if ID not in list.
+ */
+static struct sftp_zombie_requests *
+find_zombie_request(LIBSSH2_SFTP *sftp, uint32_t request_id)
+{
+    struct sftp_zombie_requests *zombie =
+        _libssh2_list_first(&sftp->zombie_requests);
+
+    while(zombie) {
+        if(zombie->request_id == request_id)
+            break;
+        else
+            zombie = _libssh2_list_next(&zombie->node);
+    }
+
+    return zombie;
+}
+
+static void
+remove_zombie_request(LIBSSH2_SFTP *sftp, uint32_t request_id)
+{
+    LIBSSH2_SESSION *session = sftp->channel->session;
+
+    struct sftp_zombie_requests *zombie = find_zombie_request(sftp,
+                                                              request_id);
+    if(zombie) {
+        _libssh2_debug(session, LIBSSH2_TRACE_SFTP,
+                       "Removing request ID %ld from the list of zombie requests",
+                       request_id);
+
+        _libssh2_list_remove(&zombie->node);
+        LIBSSH2_FREE(session, zombie);
+    }
+}
+
+static int
+add_zombie_request(LIBSSH2_SFTP *sftp, uint32_t request_id)
+{
+    LIBSSH2_SESSION *session = sftp->channel->session;
+
+    struct sftp_zombie_requests *zombie;
+
+    _libssh2_debug(session, LIBSSH2_TRACE_SFTP,
+                   "Marking request ID %ld as a zombie request", request_id);
+
+    zombie = LIBSSH2_ALLOC(sftp->channel->session,
+                           sizeof(struct sftp_zombie_requests));
+    if (!zombie)
+        return _libssh2_error(session, LIBSSH2_ERROR_ALLOC,
+                              "malloc fail for zombie request  ID");
+    else {
+        zombie->request_id = request_id;
+        _libssh2_list_add(&sftp->zombie_requests, &zombie->node);
+        return LIBSSH2_ERROR_NONE;
+    }
+}
+
+/*
  * sftp_packet_add
  *
  * Add a packet to the SFTP packet brigade
@@ -143,9 +202,71 @@ sftp_packet_add(LIBSSH2_SFTP *sftp, unsigned char *data,
 {
     LIBSSH2_SESSION *session = sftp->channel->session;
     LIBSSH2_SFTP_PACKET *packet;
+    uint32_t request_id;
 
-    _libssh2_debug(session, LIBSSH2_TRACE_SFTP, "Received packet %d (len %d)",
+    _libssh2_debug(session, LIBSSH2_TRACE_SFTP,
+                   "Received packet type %d (len %d)",
                    (int) data[0], data_len);
+
+    /*
+     * Experience shows that if we mess up EAGAIN handling somewhere or
+     * otherwise get out of sync with the channel, this is where we first get
+     * a wrong byte and if so we need to bail out at once to aid tracking the
+     * problem better.
+     */
+
+    switch(data[0]) {
+    case SSH_FXP_INIT:
+    case SSH_FXP_VERSION:
+    case SSH_FXP_OPEN:
+    case SSH_FXP_CLOSE:
+    case SSH_FXP_READ:
+    case SSH_FXP_WRITE:
+    case SSH_FXP_LSTAT:
+    case SSH_FXP_FSTAT:
+    case SSH_FXP_SETSTAT:
+    case SSH_FXP_FSETSTAT:
+    case SSH_FXP_OPENDIR:
+    case SSH_FXP_READDIR:
+    case SSH_FXP_REMOVE:
+    case SSH_FXP_MKDIR:
+    case SSH_FXP_RMDIR:
+    case SSH_FXP_REALPATH:
+    case SSH_FXP_STAT:
+    case SSH_FXP_RENAME:
+    case SSH_FXP_READLINK:
+    case SSH_FXP_SYMLINK:
+    case SSH_FXP_STATUS:
+    case SSH_FXP_HANDLE:
+    case SSH_FXP_DATA:
+    case SSH_FXP_NAME:
+    case SSH_FXP_ATTRS:
+    case SSH_FXP_EXTENDED:
+    case SSH_FXP_EXTENDED_REPLY:
+        break;
+    default:
+        return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                              "Out of sync with the world");
+    }
+
+    request_id = _libssh2_ntohu32(&data[1]);
+
+    _libssh2_debug(session, LIBSSH2_TRACE_SFTP, "Received packet id %d",
+                   request_id);
+
+    /* Don't add the packet if it answers a request we've given up on. */
+    if((data[0] == SSH_FXP_STATUS || data[0] == SSH_FXP_DATA)
+       && find_zombie_request(sftp, request_id)) {
+
+        /* If we get here, the file ended before the response arrived. We
+           are no longer interested in the request so we discard it */
+
+        LIBSSH2_FREE(session, data);
+
+        remove_zombie_request(sftp, request_id);
+        return LIBSSH2_ERROR_NONE;
+    }
+
     packet = LIBSSH2_ALLOC(session, sizeof(LIBSSH2_SFTP_PACKET));
     if (!packet) {
         return _libssh2_error(session, LIBSSH2_ERROR_ALLOC,
@@ -154,11 +275,11 @@ sftp_packet_add(LIBSSH2_SFTP *sftp, unsigned char *data,
 
     packet->data = data;
     packet->data_len = data_len;
-    packet->request_id = _libssh2_ntohu32(&data[1]);
+    packet->request_id = request_id;
 
     _libssh2_list_add(&sftp->packets, &packet->node);
 
-    return 0;
+    return LIBSSH2_ERROR_NONE;
 }
 
 /*
@@ -171,92 +292,131 @@ sftp_packet_read(LIBSSH2_SFTP *sftp)
 {
     LIBSSH2_CHANNEL *channel = sftp->channel;
     LIBSSH2_SESSION *session = channel->session;
-    unsigned char *packet;
-    size_t packet_received;
+    unsigned char *packet = NULL;
     ssize_t rc;
-    uint32_t packet_len; /* 32bits on the wire */
+    unsigned long recv_window;
+    int packet_type;
 
     _libssh2_debug(session, LIBSSH2_TRACE_SFTP, "recv packet");
 
-    /* If there was a previous partial, start using it */
-    if (sftp->partial_packet) {
+    switch(sftp->packet_state) {
+    case libssh2_NB_state_sent: /* EAGAIN from window adjusting */
+        sftp->packet_state = libssh2_NB_state_idle;
 
         packet = sftp->partial_packet;
-        packet_len = sftp->partial_len;
-        packet_received = sftp->partial_received;
+        goto window_adjust;
+
+    case libssh2_NB_state_sent1: /* EAGAIN from channel read */
+        sftp->packet_state = libssh2_NB_state_idle;
+
+        packet = sftp->partial_packet;
+
+        _libssh2_debug(session, LIBSSH2_TRACE_SFTP,
+                       "partial read cont, len: %lu", sftp->partial_len);
+        _libssh2_debug(session, LIBSSH2_TRACE_SFTP,
+                       "partial read cont, already recvd: %lu",
+                       sftp->partial_received);
+        /* fall-through */
+    default:
+        if(!packet) {
+            /* only do this if there's not already a packet buffer allocated
+               to use */
+
+            /* each packet starts with a 32 bit length field */
+            rc = _libssh2_channel_read(channel, 0,
+                                       (char *)&sftp->partial_size[
+                                           sftp->partial_size_len],
+                                       4 - sftp->partial_size_len);
+            if (rc == LIBSSH2_ERROR_EAGAIN)
+                return rc;
+            else if (rc < 0)
+                return _libssh2_error(session, rc, "channel read");
+
+            sftp->partial_size_len += rc;
+
+            if(4 != sftp->partial_size_len)
+                /* we got a short read for the length part */
+                return LIBSSH2_ERROR_EAGAIN;
+
+            sftp->partial_len = _libssh2_ntohu32(sftp->partial_size);
+            /* make sure we don't proceed if the packet size is unreasonably
+               large */
+            if (sftp->partial_len > LIBSSH2_SFTP_PACKET_MAXLEN)
+                return _libssh2_error(session,
+                                      LIBSSH2_ERROR_CHANNEL_PACKET_EXCEEDED,
+                                      "SFTP packet too large");
+
+            _libssh2_debug(session, LIBSSH2_TRACE_SFTP,
+                           "Data begin - Packet Length: %lu",
+                           sftp->partial_len);
+            packet = LIBSSH2_ALLOC(session, sftp->partial_len);
+            if (!packet)
+                return _libssh2_error(session, LIBSSH2_ERROR_ALLOC,
+                                      "Unable to allocate SFTP packet");
+            sftp->partial_size_len = 0;
+            sftp->partial_received = 0; /* how much of the packet already
+                                           received */
+            sftp->partial_packet = packet;
+
+          window_adjust:
+            recv_window = libssh2_channel_window_read_ex(channel, NULL, NULL);
+
+            if(sftp->partial_len > recv_window) {
+                /* ask for twice the data amount we need at once */
+                rc = _libssh2_channel_receive_window_adjust(channel,
+                                                            sftp->partial_len*2,
+                                                            1, NULL);
+                /* store the state so that we continue with the correct
+                   operation at next invoke */
+                sftp->packet_state = (rc == LIBSSH2_ERROR_EAGAIN)?
+                    libssh2_NB_state_sent:
+                    libssh2_NB_state_idle;
+
+                if(rc == LIBSSH2_ERROR_EAGAIN)
+                    return rc;
+            }
+        }
+
+        /* Read as much of the packet as we can */
+        while (sftp->partial_len > sftp->partial_received) {
+            rc = _libssh2_channel_read(channel, 0,
+                                       (char *)&packet[sftp->partial_received],
+                                       sftp->partial_len -
+                                       sftp->partial_received);
+
+            if (rc == LIBSSH2_ERROR_EAGAIN) {
+                /*
+                 * We received EAGAIN, save what we have and return EAGAIN to
+                 * the caller. Set 'partial_packet' so that this function
+                 * knows how to continue on the next invoke.
+                 */
+                sftp->packet_state = libssh2_NB_state_sent1;
+                return rc;
+            }
+            else if (rc < 0) {
+                LIBSSH2_FREE(session, packet);
+                sftp->partial_packet = NULL;
+                return _libssh2_error(session, rc,
+                                      "Error waiting for SFTP packet");
+            }
+            sftp->partial_received += rc;
+        }
+
         sftp->partial_packet = NULL;
 
-        _libssh2_debug(session, LIBSSH2_TRACE_SFTP,
-                       "partial read cont, len: %lu", packet_len);
-    }
-    else {
-        /* each packet starts with a 32 bit length field */
-        rc = _libssh2_channel_read(channel, 0,
-                                   (char *)&sftp->partial_size[
-                                       sftp->partial_size_len],
-                                   4 - sftp->partial_size_len);
-        if (rc == LIBSSH2_ERROR_EAGAIN)
-            return rc;
-        else if (rc < 0)
-            return _libssh2_error(session, rc, "channel read");
-
-        sftp->partial_size_len += rc;
-
-        if(4 != sftp->partial_size_len)
-            /* we got a short read for the length part */
-            return LIBSSH2_ERROR_EAGAIN;
-
-        packet_len = _libssh2_ntohu32(sftp->partial_size);
-        /* make sure we don't proceed if the packet size is unreasonably
-           large */
-        if (packet_len > LIBSSH2_SFTP_PACKET_MAXLEN)
-            return _libssh2_error(session,
-                                  LIBSSH2_ERROR_CHANNEL_PACKET_EXCEEDED,
-                                  "SFTP packet too large");
-
-        _libssh2_debug(session, LIBSSH2_TRACE_SFTP,
-                       "Data begin - Packet Length: %lu", packet_len);
-        packet = LIBSSH2_ALLOC(session, packet_len);
-        if (!packet)
-            return _libssh2_error(session, LIBSSH2_ERROR_ALLOC,
-                                  "Unable to allocate SFTP packet");
-        sftp->partial_size_len = 0;
-        packet_received = 0;
-    }
-
-    /* Read as much of the packet as we can */
-    while (packet_len > packet_received) {
-        rc = _libssh2_channel_read(channel, 0,
-                                   (char *) packet + packet_received,
-                                   packet_len - packet_received);
-
-        if (rc == LIBSSH2_ERROR_EAGAIN) {
-            /*
-             * We received EAGAIN, save what we have and return EAGAIN to the
-             * caller
-             */
-            sftp->partial_packet = packet;
-            sftp->partial_len = packet_len;
-            sftp->partial_received = packet_received;
-            return rc;
-        }
-        else if (rc < 0) {
+        /* sftp_packet_add takes ownership of the packet and might free it
+           so we take a copy of the packet type before we call it. */
+        packet_type = packet[0];
+        rc = sftp_packet_add(sftp, packet, sftp->partial_len);
+        if (rc) {
             LIBSSH2_FREE(session, packet);
-            return _libssh2_error(session, rc,
-                                  "Error waiting for SFTP packet");
+            return rc;
         }
-        packet_received += rc;
+        else {
+            return packet_type;
+        }
     }
-
-    sftp->partial_packet = NULL;
-
-    rc = sftp_packet_add(sftp, packet, packet_len);
-    if (rc) {
-        LIBSSH2_FREE(session, packet);
-        return rc;
-    }
-
-    return packet[0];
+    /* WON'T REACH */
 }
 /*
  * sftp_packetlist_flush
@@ -287,6 +447,10 @@ static void sftp_packetlist_flush(LIBSSH2_SFTP_HANDLE *handle)
         if(!rc)
             /* we found a packet, free it */
             LIBSSH2_FREE(session, data);
+        else if(chunk->sent)
+            /* there was no incoming packet for this request, mark this
+               request as a zombie if it ever sent the request */
+            add_zombie_request(sftp, chunk->request_id);
 
         _libssh2_list_remove(&chunk->node);
         LIBSSH2_FREE(session, chunk);
@@ -357,10 +521,7 @@ sftp_packet_require(LIBSSH2_SFTP *sftp, unsigned char packet_type,
 
     while (session->socket_state == LIBSSH2_SOCKET_CONNECTED) {
         rc = sftp_packet_read(sftp);
-        if (rc == LIBSSH2_ERROR_EAGAIN)
-            return rc;
-        else if (rc <= 0)
-            /* TODO: isn't this supposed to be < 0 only? */
+        if (rc < 0)
             return rc;
 
         /* data was read, check the queue again */
@@ -377,7 +538,7 @@ sftp_packet_require(LIBSSH2_SFTP *sftp, unsigned char packet_type,
 }
 
 /* sftp_packet_requirev
- * Require one of N possible reponses
+ * Require one of N possible responses
  */
 static int
 sftp_packet_requirev(LIBSSH2_SFTP *sftp, int num_valid_responses,
@@ -563,7 +724,7 @@ static LIBSSH2_SFTP *sftp_init(LIBSSH2_SESSION *session)
          *
          * Note that you MUST NOT try to call libssh2_sftp_init() again to get
          * another handle until the previous call has finished and either
-         * succesffully made a handle or failed and returned error (not
+         * successfully made a handle or failed and returned error (not
          * including *EAGAIN).
          */
 
@@ -624,13 +785,12 @@ static LIBSSH2_SFTP *sftp_init(LIBSSH2_SESSION *session)
 
         sftp_handle =
             session->sftpInit_sftp =
-            LIBSSH2_ALLOC(session, sizeof(LIBSSH2_SFTP));
+            LIBSSH2_CALLOC(session, sizeof(LIBSSH2_SFTP));
         if (!sftp_handle) {
             _libssh2_error(session, LIBSSH2_ERROR_ALLOC,
                            "Unable to allocate a new SFTP structure");
             goto sftp_init_error;
         }
-        memset(sftp_handle, 0, sizeof(LIBSSH2_SFTP));
         sftp_handle->channel = session->sftpInit_channel;
         sftp_handle->request_id = 0;
 
@@ -676,18 +836,17 @@ static LIBSSH2_SFTP *sftp_init(LIBSSH2_SESSION *session)
 
     rc = sftp_packet_require(sftp_handle, SSH_FXP_VERSION,
                              0, &data, &data_len);
-    if (rc == LIBSSH2_ERROR_EAGAIN) {
-        _libssh2_error(session, LIBSSH2_ERROR_EAGAIN,
-                       "Would block waiting for response from SFTP subsystem");
+    if (rc == LIBSSH2_ERROR_EAGAIN)
         return NULL;
-    } else if (rc) {
-        _libssh2_error(session, LIBSSH2_ERROR_SOCKET_TIMEOUT,
+    else if (rc) {
+        _libssh2_error(session, rc,
                        "Timeout waiting for response from SFTP subsystem");
         goto sftp_init_error;
     }
     if (data_len < 5) {
         _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
                        "Invalid SSH_FXP_VERSION response");
+        LIBSSH2_FREE(session, data);
         goto sftp_init_error;
     }
 
@@ -701,7 +860,7 @@ static LIBSSH2_SFTP *sftp_init(LIBSSH2_SESSION *session)
         sftp_handle->version = LIBSSH2_SFTP_VERSION;
     }
     _libssh2_debug(session, LIBSSH2_TRACE_SFTP,
-                   "Enabling SFTP version %lu compatability",
+                   "Enabling SFTP version %lu compatibility",
                    sftp_handle->version);
     while (s < (data + data_len)) {
         size_t extname_len, extdata_len;
@@ -772,7 +931,7 @@ LIBSSH2_API LIBSSH2_SFTP *libssh2_sftp_init(LIBSSH2_SESSION *session)
 /*
  * sftp_shutdown
  *
- * Shutsdown the SFTP subsystem
+ * Shuts down the SFTP subsystem
  */
 static int
 sftp_shutdown(LIBSSH2_SFTP *sftp)
@@ -829,6 +988,10 @@ sftp_shutdown(LIBSSH2_SFTP *sftp)
     if (sftp->symlink_packet) {
         LIBSSH2_FREE(session, sftp->symlink_packet);
         sftp->symlink_packet = NULL;
+    }
+    if (sftp->fsync_packet) {
+        LIBSSH2_FREE(session, sftp->fsync_packet);
+        sftp->fsync_packet = NULL;
     }
 
     sftp_packet_flush(sftp);
@@ -1013,14 +1176,13 @@ sftp_open(LIBSSH2_SFTP *sftp, const char *filename,
             return NULL;
         }
 
-        fp = LIBSSH2_ALLOC(session, sizeof(LIBSSH2_SFTP_HANDLE));
+        fp = LIBSSH2_CALLOC(session, sizeof(LIBSSH2_SFTP_HANDLE));
         if (!fp) {
             _libssh2_error(session, LIBSSH2_ERROR_ALLOC,
                            "Unable to allocate new SFTP handle structure");
             LIBSSH2_FREE(session, data);
             return NULL;
         }
-        memset(fp, 0, sizeof(LIBSSH2_SFTP_HANDLE));
         fp->handle_type = open_file ? LIBSSH2_SFTP_HANDLE_FILE :
             LIBSSH2_SFTP_HANDLE_DIR;
 
@@ -1085,280 +1247,374 @@ static ssize_t sftp_read(LIBSSH2_SFTP_HANDLE * handle, char *buffer,
     struct sftp_pipeline_chunk *chunk;
     struct sftp_pipeline_chunk *next;
     ssize_t rc;
-    size_t eagain = 0;
-    size_t total_read = 0;
     struct _libssh2_sftp_handle_file_data *filep =
         &handle->u.file;
+    size_t bytes_in_buffer = 0;
+    char *sliding_bufferp = buffer;
 
-    /* Number of bytes asked for that haven't been acked yet */
-    size_t already = (filep->offset_sent - filep->offset);
+    /* This function can be interrupted in three different places where it
+       might need to wait for data from the network.  It returns EAGAIN to
+       allow non-blocking clients to do other work but these client are
+       expected to call this function again (possibly many times) to finish
+       the operation.
 
-    if(filep->data_left) {
-        /* data left from previous call */
-        size_t copy = MIN(buffer_size, filep->data_left);
+       The tricky part is that if we previously aborted a sftp_read due to
+       EAGAIN, we must continue at the same spot to continue the previously
+       interrupted operation.  This is done using a state machine to record
+       what phase of execution we were at.  The state is stored in
+       sftp->read_state.
 
-        memcpy(buffer, &filep->data[ filep->data_len - filep->data_left],
-               copy);
+       libssh2_NB_state_idle: The first phase is where we prepare multiple
+       FXP_READ packets to do optimistic read-ahead.  We send off as many as
+       possible in the second phase without waiting for a response to each
+       one; this is the key to fast reads. But we may have to adjust the
+       channel window size to do this which may interrupt this function while
+       waiting.  The state machine saves the phase as libssh2_NB_state_idle so
+       it returns here on the next call.
 
-        total_read += copy;
-        filep->data_left -= copy;
-        filep->offset += copy;
+       libssh2_NB_state_sent: The second phase is where we send the FXP_READ
+       packets.  Writing them to the channel can be interrupted with EAGAIN
+       but the state machine ensures we skip the first phase on the next call
+       and resume sending.
 
-        if(filep->data_left)
-            return total_read;
+       libssh2_NB_state_sent2: In the third phase (indicated by ) we read the
+       data from the responses that have arrived so far.  Reading can be
+       interrupted with EAGAIN but the state machine ensures we skip the first
+       and second phases on the next call and resume sending.
+    */
 
-        LIBSSH2_FREE(session, filep->data);
-        filep->data = NULL;
-    }
+    switch (sftp->read_state) {
+    case libssh2_NB_state_idle:
 
-    /* if we previously aborted a channel_write due to EAGAIN, we must
-       continue that writing so that we don't risk trying to send another
-       channel_write here to enlarge the receive window */
-    if(sftp->read_state == libssh2_NB_state_sent)
-        goto send_read_requests;
+        /* Some data may already have been read from the server in the
+           previous call but didn't fit in the buffer at the time.  If so, we
+           return that now as we can't risk being interrupted later with data
+           partially written to the buffer. */
+        if(filep->data_left) {
+            size_t copy = MIN(buffer_size, filep->data_left);
 
-    /* We allow a number of bytes being requested at any given time without
-       having been acked - until we reach EOF. */
-    if(!filep->eof) {
-        size_t max_read_ahead = buffer_size*4;
-        unsigned long recv_window;
+            memcpy(buffer, &filep->data[ filep->data_len - filep->data_left],
+                   copy);
 
-        if(max_read_ahead > LIBSSH2_CHANNEL_WINDOW_DEFAULT*4)
-            max_read_ahead = LIBSSH2_CHANNEL_WINDOW_DEFAULT*4;
+            filep->data_left -= copy;
+            filep->offset += copy;
 
-        /* if the buffer_size passed in now is smaller than what has already
-           been sent, we risk getting count become a very large number */
-        if(max_read_ahead > already)
-            count = max_read_ahead - already;
-
-        /* 'count' is how much more data to ask for, and 'already' is how much
-           data that already has been asked for but not yet returned.
-           Specificly, 'count' means how much data that have or will be asked
-           for by the nodes that are already added to the linked list. Some of
-           those read requests may not actually have been sent off
-           successfully yet.
-
-           If 'already' is very large it should be perfectly fine to have
-           count set to 0 as then we don't have to ask for more data (right
-           now).
-
-           buffer_size*4 is just picked more or less out of the air. The idea
-           is that when reading SFTP from a remote server, we send away
-           multiple read requests guessing that the client will read more than
-           only this 'buffer_size' amount of memory. So we ask for maximum
-           buffer_size*4 amount of data so that we can return them very fast
-           in subsequent calls.
-        */
-
-        recv_window = libssh2_channel_window_read_ex(sftp->channel,
-                                                     NULL, NULL);
-        if(max_read_ahead > recv_window) {
-            /* more data will be asked for than what the window currently
-               allows, expand it! */
-
-            if(total_read)
-                /* since we risk getting EAGAIN below, we return here if
-                   there is data available */
-                return total_read;
-
-            rc = _libssh2_channel_receive_window_adjust(sftp->channel,
-                                                        max_read_ahead*8,
-                                                        0, NULL);
-            /* if this returns EAGAIN, we will get back to this function
-               at next call */
-            if (rc)
-                return rc;
-        }
-    }
-
-    while(count > 0) {
-        unsigned char *s;
-        uint32_t size = MIN(MAX_SFTP_READ_SIZE, count);
-
-        /* 25 = packet_len(4) + packet_type(1) + request_id(4) +
-           handle_len(4) + offset(8) + count(4) */
-        uint32_t packet_len = (uint32_t)handle->handle_len + 25;
-        uint32_t request_id;
-
-        chunk = LIBSSH2_ALLOC(session, packet_len +
-                              sizeof(struct sftp_pipeline_chunk));
-        if (!chunk)
-            return _libssh2_error(session, LIBSSH2_ERROR_ALLOC,
-                                  "malloc fail for FXP_WRITE");
-
-        chunk->len = size;
-        chunk->lefttosend = packet_len;
-        chunk->sent = 0;
-
-        s = chunk->packet;
-
-        _libssh2_store_u32(&s, packet_len - 4);
-        *s++ = SSH_FXP_READ;
-        request_id = sftp->request_id++;
-        chunk->request_id = request_id;
-        _libssh2_store_u32(&s, request_id);
-        _libssh2_store_str(&s, handle->handle, handle->handle_len);
-        _libssh2_store_u64(&s, filep->offset_sent);
-        filep->offset_sent += size; /* advance offset at once */
-        _libssh2_store_u32(&s, size);
-
-        /* add this new entry LAST in the list */
-        _libssh2_list_add(&handle->packet_list, &chunk->node);
-        count -= size; /* deduct the size we used, as we might have
-                          to create more packets */
-    }
-
-  send_read_requests:
-
-    /* move through the READ packets that haven't been sent and send as many
-       as possible - remember that we don't block */
-    chunk = _libssh2_list_first(&handle->packet_list);
-
-    sftp->read_state = libssh2_NB_state_idle;
-
-    while(chunk) {
-        if(chunk->lefttosend) {
-            rc = _libssh2_channel_write(channel, 0,
-                                        &chunk->packet[chunk->sent],
-                                        chunk->lefttosend);
-            if(rc < 0) {
-                if(rc != LIBSSH2_ERROR_EAGAIN)
-                    /* error */
-                    return rc;
-                eagain++;
-                sftp->read_state = libssh2_NB_state_sent;
-                break;
+            if(!filep->data_left) {
+                LIBSSH2_FREE(session, filep->data);
+                filep->data = NULL;
             }
 
-            /* remember where to continue sending the next time */
-            chunk->lefttosend -= rc;
-            chunk->sent += rc;
-
-            if(chunk->lefttosend)
-                /* data left to send, get out of loop */
-                break;
+            return copy;
         }
 
-        /* move on to the next chunk with data to send */
-        chunk = _libssh2_list_next(&chunk->node);
-    }
+        if (filep->eof) {
+            return 0;
+        } else {
+            /* We allow a number of bytes being requested at any given time
+               without having been acked - until we reach EOF. */
 
-    /*
-     * Count all ACKed packets and act on the contents of them.
-     */
-    chunk = _libssh2_list_first(&handle->packet_list);
+            /* Number of bytes asked for that haven't been acked yet */
+            size_t already = (size_t)(filep->offset_sent - filep->offset);
 
-    while(chunk) {
-        unsigned char *data;
-        size_t data_len;
-        uint32_t rc32;
-        static const unsigned char read_responses[2] = {
-            SSH_FXP_DATA, SSH_FXP_STATUS
-        };
+            size_t max_read_ahead = buffer_size*4;
+            unsigned long recv_window;
 
-        if(chunk->lefttosend)
-            /* if the chunk still has data left to send, we shouldn't wait for
-               an ACK for it just yet */
-            break;
+            if(max_read_ahead > LIBSSH2_CHANNEL_WINDOW_DEFAULT*4)
+                max_read_ahead = LIBSSH2_CHANNEL_WINDOW_DEFAULT*4;
 
-        rc = sftp_packet_requirev(sftp, 2, read_responses,
-                                  chunk->request_id, &data, &data_len);
-        if (rc == LIBSSH2_ERROR_EAGAIN) {
-            eagain++;
-            break;
+            /* if the buffer_size passed in now is smaller than what has
+               already been sent, we risk getting count become a very large
+               number */
+            if(max_read_ahead > already)
+                count = max_read_ahead - already;
+
+            /* 'count' is how much more data to ask for, and 'already' is how
+               much data that already has been asked for but not yet returned.
+               Specificly, 'count' means how much data that have or will be
+               asked for by the nodes that are already added to the linked
+               list. Some of those read requests may not actually have been
+               sent off successfully yet.
+
+               If 'already' is very large it should be perfectly fine to have
+               count set to 0 as then we don't have to ask for more data
+               (right now).
+
+               buffer_size*4 is just picked more or less out of the air. The
+               idea is that when reading SFTP from a remote server, we send
+               away multiple read requests guessing that the client will read
+               more than only this 'buffer_size' amount of memory. So we ask
+               for maximum buffer_size*4 amount of data so that we can return
+               them very fast in subsequent calls.
+            */
+
+            recv_window = libssh2_channel_window_read_ex(sftp->channel,
+                                                         NULL, NULL);
+            if(max_read_ahead > recv_window) {
+                /* more data will be asked for than what the window currently
+                   allows, expand it! */
+
+                rc = _libssh2_channel_receive_window_adjust(sftp->channel,
+                                                            max_read_ahead*8,
+                                                            1, NULL);
+                /* if this returns EAGAIN, we will get back to this function
+                   at next call */
+                assert(rc != LIBSSH2_ERROR_EAGAIN || !filep->data_left);
+                assert(rc != LIBSSH2_ERROR_EAGAIN || !filep->eof);
+                if (rc)
+                    return rc;
+            }
         }
-        else if (rc)
-            return _libssh2_error(session, rc,
-                                  "Error waiting for FXP_READ ACK");
+
+        while(count > 0) {
+            unsigned char *s;
+
+            /* 25 = packet_len(4) + packet_type(1) + request_id(4) +
+               handle_len(4) + offset(8) + count(4) */
+            uint32_t packet_len = (uint32_t)handle->handle_len + 25;
+            uint32_t request_id;
+
+            uint32_t size = count;
+            if (size < buffer_size)
+                size = buffer_size;
+            if (size > MAX_SFTP_READ_SIZE)
+                size = MAX_SFTP_READ_SIZE;
+
+            chunk = LIBSSH2_ALLOC(session, packet_len +
+                                  sizeof(struct sftp_pipeline_chunk));
+            if (!chunk)
+                return _libssh2_error(session, LIBSSH2_ERROR_ALLOC,
+                                      "malloc fail for FXP_WRITE");
+
+            chunk->offset = filep->offset_sent;
+            chunk->len = size;
+            chunk->lefttosend = packet_len;
+            chunk->sent = 0;
+
+            s = chunk->packet;
+
+            _libssh2_store_u32(&s, packet_len - 4);
+            *s++ = SSH_FXP_READ;
+            request_id = sftp->request_id++;
+            chunk->request_id = request_id;
+            _libssh2_store_u32(&s, request_id);
+            _libssh2_store_str(&s, handle->handle, handle->handle_len);
+            _libssh2_store_u64(&s, filep->offset_sent);
+            filep->offset_sent += size; /* advance offset at once */
+            _libssh2_store_u32(&s, size);
+
+            /* add this new entry LAST in the list */
+            _libssh2_list_add(&handle->packet_list, &chunk->node);
+            count -= MIN(size,count); /* deduct the size we used, as we might
+                                       * have to create more packets */
+            _libssh2_debug(session, LIBSSH2_TRACE_SFTP,
+                           "read request id %d sent (offset: %d, size: %d)",
+                           request_id, (int)chunk->offset, (int)chunk->len);
+        }
+
+    case libssh2_NB_state_sent:
+
+        sftp->read_state = libssh2_NB_state_idle;
+
+        /* move through the READ packets that haven't been sent and send as
+           many as possible - remember that we don't block */
+        chunk = _libssh2_list_first(&handle->packet_list);
+
+        while(chunk) {
+            if(chunk->lefttosend) {
+
+                rc = _libssh2_channel_write(channel, 0,
+                                            &chunk->packet[chunk->sent],
+                                            chunk->lefttosend);
+                if(rc < 0) {
+                    sftp->read_state = libssh2_NB_state_sent;
+                    return rc;
+                }
+
+                /* remember where to continue sending the next time */
+                chunk->lefttosend -= rc;
+                chunk->sent += rc;
+
+                if(chunk->lefttosend) {
+                    /* We still have data left to send for this chunk.
+                     * If there is at least one completely sent chunk,
+                     * we can get out of this loop and start reading.  */
+                    if (chunk != _libssh2_list_first(&handle->packet_list)) {
+                        break;
+                    } else {
+                        continue;
+                    }
+                }
+            }
+
+            /* move on to the next chunk with data to send */
+            chunk = _libssh2_list_next(&chunk->node);
+        }
+
+    case libssh2_NB_state_sent2:
+
+        sftp->read_state = libssh2_NB_state_idle;
 
         /*
-         * We get DATA or STATUS back. STATUS can be error, or it is FX_EOF
-         * when we reach the end of the file.
+         * Count all ACKed packets and act on the contents of them.
          */
+        chunk = _libssh2_list_first(&handle->packet_list);
 
-        switch (data[0]) {
-        case SSH_FXP_STATUS:
-            /* we must remove all outstanding READ requests, as either we got
-               an error or we're at end of file */
-            sftp_packetlist_flush(handle);
+        while(chunk) {
+            unsigned char *data;
+            size_t data_len;
+            uint32_t rc32;
+            static const unsigned char read_responses[2] = {
+                SSH_FXP_DATA, SSH_FXP_STATUS
+            };
 
-            rc32 = _libssh2_ntohu32(data + 5);
-            LIBSSH2_FREE(session, data);
-
-            if (rc32 == LIBSSH2_FX_EOF) {
-                filep->eof = TRUE;
-                return total_read;
-            }
-            else {
-                sftp->last_errno = rc32;
-                return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
-                                      "SFTP READ error");
-            }
-            break;
-
-        case SSH_FXP_DATA:
-            rc32 = _libssh2_ntohu32(data + 5);
-            if (rc32 > (data_len - 9))
-                return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
-                                      "SFTP Protocol badness");
-
-            if(rc32 != chunk->len) {
-                /* a short read does not imply end of file, but we must adjust
-                   the offset_sent since it was advanced with a full
-                   chunk->len before */
-                filep->offset_sent -= (chunk->len - rc32);
+            if(chunk->lefttosend) {
+                /* if the chunk still has data left to send, we shouldn't wait
+                   for an ACK for it just yet */
+                if (bytes_in_buffer > 0) {
+                    return bytes_in_buffer;
+                } else {
+                    /* we should never reach this point */
+                    return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                                          "sftp_read() internal error");
+                }
             }
 
-            if(total_read + rc32 > buffer_size) {
-                /* figure out the overlap amount */
-                filep->data_left = (total_read + rc32) - buffer_size;
+            rc = sftp_packet_requirev(sftp, 2, read_responses,
+                                      chunk->request_id, &data, &data_len);
 
-                /* getting the full packet would overflow the buffer, so
-                   only get the correct amount and keep the remainder */
-                rc32 = (uint32_t)(buffer_size - total_read);
-
-                /* store data to keep for next call */
-                filep->data = data;
-                filep->data_len = data_len;
+            if (rc==LIBSSH2_ERROR_EAGAIN && bytes_in_buffer != 0) {
+                /* do not return EAGAIN if we have already
+                 * written data into the buffer */
+                return bytes_in_buffer;
             }
-            else
-                filep->data_len = 0;
 
-            /* copy the received data from the received FXP_DATA packet to the
-               buffer at the correct index */
-            memcpy(buffer + total_read, data + 9, rc32);
-            filep->offset += rc32;
-            total_read += rc32;
+            if (rc < 0) {
+                sftp->read_state = libssh2_NB_state_sent2;
+                return rc;
+            }
 
-            if(!filep->data_len)
-                /* free the allocated data if not stored to keep */
+            /*
+             * We get DATA or STATUS back. STATUS can be error, or it is
+             * FX_EOF when we reach the end of the file.
+             */
+
+            switch (data[0]) {
+            case SSH_FXP_STATUS:
+                /* remove the chunk we just processed */
+
+                _libssh2_list_remove(&chunk->node);
+                LIBSSH2_FREE(session, chunk);
+
+                /* we must remove all outstanding READ requests, as either we
+                   got an error or we're at end of file */
+                sftp_packetlist_flush(handle);
+
+                rc32 = _libssh2_ntohu32(data + 5);
                 LIBSSH2_FREE(session, data);
-            else {
-                /* force the loop to end since the receive buffer is full
-                   already, but remove this chunk from the list first */
-                _libssh2_list_remove(&chunk->node); /* remove from list */
-                LIBSSH2_FREE(session, chunk); /* free memory */
 
-                chunk = NULL;
-                continue;
+                if (rc32 == LIBSSH2_FX_EOF) {
+                    filep->eof = TRUE;
+                    return bytes_in_buffer;
+                }
+                else {
+                    sftp->last_errno = rc32;
+                    return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                                          "SFTP READ error");
+                }
+                break;
+
+            case SSH_FXP_DATA:
+                if (chunk->offset != filep->offset) {
+                    /* This could happen if the server returns less bytes than
+                       requested, which shouldn't happen for normal files. See:
+                       https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02
+                       #section-6.4
+                    */
+                    return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                                          "Read Packet At Unexpected Offset");
+                }
+
+                rc32 = _libssh2_ntohu32(data + 5);
+                if (rc32 > (data_len - 9))
+                    return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                                          "SFTP Protocol badness");
+
+                if(rc32 > chunk->len) {
+                    /* A chunk larger than we requested was returned to us.
+                       This is a protocol violation and we don't know how to
+                       deal with it. Bail out! */
+                    return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                                          "FXP_READ response too big");
+                }
+
+                if(rc32 != chunk->len) {
+                    /* a short read does not imply end of file, but we must
+                       adjust the offset_sent since it was advanced with a
+                       full chunk->len before */
+                    filep->offset_sent -= (chunk->len - rc32);
+                }
+
+                if((bytes_in_buffer + rc32) > buffer_size) {
+                    /* figure out the overlap amount */
+                    filep->data_left = (bytes_in_buffer + rc32) - buffer_size;
+
+                    /* getting the full packet would overflow the buffer, so
+                       only get the correct amount and keep the remainder */
+                    rc32 = (uint32_t)buffer_size - bytes_in_buffer;
+
+                    /* store data to keep for next call */
+                    filep->data = data;
+                    filep->data_len = data_len;
+                }
+                else
+                    filep->data_len = 0;
+
+                /* copy the received data from the received FXP_DATA packet to
+                   the buffer at the correct index */
+                memcpy(sliding_bufferp, data + 9, rc32);
+                filep->offset += rc32;
+                bytes_in_buffer += rc32;
+                sliding_bufferp += rc32;
+
+                if(filep->data_len == 0)
+                    /* free the allocated data if not stored to keep */
+                    LIBSSH2_FREE(session, data);
+
+                /* remove the chunk we just processed keeping track of the
+                 * next one in case we need it */
+                next = _libssh2_list_next(&chunk->node);
+                _libssh2_list_remove(&chunk->node);
+                LIBSSH2_FREE(session, chunk);
+
+                /* check if we have space left in the buffer
+                 * and either continue to the next chunk or stop
+                 */
+                if (bytes_in_buffer < buffer_size) {
+                    chunk = next;
+                } else {
+                    chunk = NULL;
+                }
+
+                break;
+            default:
+                return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                                      "SFTP Protocol badness: unrecognised "
+                                      "read request response");
             }
-            break;
         }
 
-        next = _libssh2_list_next(&chunk->node);
+        if (bytes_in_buffer > 0)
+            return bytes_in_buffer;
 
-        _libssh2_list_remove(&chunk->node); /* remove from list */
-        LIBSSH2_FREE(session, chunk); /* free memory */
+        break;
 
-        chunk = next;
+    default:
+        assert(!"State machine error; unrecognised read state");
     }
 
-    if(total_read)
-        return total_read;
-    else if(eagain)
-        return _libssh2_error(session, LIBSSH2_ERROR_EAGAIN,
-                              "Would block sftp_read");
-    return 0;
+    /* we should never reach this point */
+    return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                          "sftp_read() internal error");
 }
 
 /* libssh2_sftp_read
@@ -1415,7 +1671,7 @@ static ssize_t sftp_readdir(LIBSSH2_SFTP_HANDLE *handle, char *buffer,
 
             filename_len = real_filename_len;
             if (filename_len >= buffer_maxlen) {
-                filename_len = LIBSSH2_ERROR_BUFFER_TOO_SMALL;
+                filename_len = (size_t)LIBSSH2_ERROR_BUFFER_TOO_SMALL;
                 goto end;
             }
 
@@ -1430,7 +1686,7 @@ static ssize_t sftp_readdir(LIBSSH2_SFTP_HANDLE *handle, char *buffer,
                 longentry_len = real_longentry_len;
 
                 if (longentry_len >= longentry_maxlen) {
-                    filename_len = LIBSSH2_ERROR_BUFFER_TOO_SMALL;
+                    filename_len = (size_t)LIBSSH2_ERROR_BUFFER_TOO_SMALL;
                     goto end;
                 }
 
@@ -1502,7 +1758,7 @@ static ssize_t sftp_readdir(LIBSSH2_SFTP_HANDLE *handle, char *buffer,
         return retcode;
     else if (retcode) {
         sftp->readdir_state = libssh2_NB_state_idle;
-        return _libssh2_error(session, LIBSSH2_ERROR_SOCKET_TIMEOUT,
+        return _libssh2_error(session, retcode,
                               "Timeout waiting for status message");
     }
 
@@ -1611,157 +1867,168 @@ static ssize_t sftp_write(LIBSSH2_SFTP_HANDLE *handle, const char *buffer,
     struct sftp_pipeline_chunk *next;
     size_t acked = 0;
     size_t org_count = count;
-    size_t eagain = 0;
+    size_t already;
 
-    /* Number of bytes sent off that haven't been acked and therefor we will
-       get passed in here again.
+    switch(sftp->write_state) {
+    default:
+    case libssh2_NB_state_idle:
 
-       Also, add up the number of bytes that actually already have been acked
-       but we haven't been able to return as such yet, so we will get that
-       data as well passed in here again.
-    */
-    size_t already = (handle->u.file.offset_sent - handle->u.file.offset)+
-        handle->u.file.acked;
+        /* Number of bytes sent off that haven't been acked and therefor we
+           will get passed in here again.
 
-    if(count >= already) {
-        /* skip the part already made into packets */
-        buffer += already;
-        count -= already;
-    }
-    else
-        /* there is more data already fine than what we got in this call */
-        count = 0;
+           Also, add up the number of bytes that actually already have been
+           acked but we haven't been able to return as such yet, so we will
+           get that data as well passed in here again.
+        */
+        already = (size_t) (handle->u.file.offset_sent - handle->u.file.offset)+
+            handle->u.file.acked;
 
-    while(count) {
-        /* TODO: Possibly this should have some logic to prevent a very very
-           small fraction to be left but lets ignore that for now */
-        uint32_t size = MIN(MAX_SFTP_OUTGOING_SIZE, count);
-        uint32_t request_id;
+        if(count >= already) {
+            /* skip the part already made into packets */
+            buffer += already;
+            count -= already;
+        }
+        else
+            /* there is more data already fine than what we got in this call */
+            count = 0;
 
-        /* 25 = packet_len(4) + packet_type(1) + request_id(4) +
-           handle_len(4) + offset(8) + count(4) */
-        packet_len = handle->handle_len + size + 25;
+        sftp->write_state = libssh2_NB_state_idle;
+        while(count) {
+            /* TODO: Possibly this should have some logic to prevent a very
+               very small fraction to be left but lets ignore that for now */
+            uint32_t size = MIN(MAX_SFTP_OUTGOING_SIZE, count);
+            uint32_t request_id;
 
-        chunk = LIBSSH2_ALLOC(session, packet_len +
-                              sizeof(struct sftp_pipeline_chunk));
-        if (!chunk)
-            return _libssh2_error(session, LIBSSH2_ERROR_ALLOC,
-                                  "malloc fail for FXP_WRITE");
+            /* 25 = packet_len(4) + packet_type(1) + request_id(4) +
+               handle_len(4) + offset(8) + count(4) */
+            packet_len = handle->handle_len + size + 25;
 
-        chunk->len = size;
-        chunk->sent = 0;
-        chunk->lefttosend = packet_len;
+            chunk = LIBSSH2_ALLOC(session, packet_len +
+                                  sizeof(struct sftp_pipeline_chunk));
+            if (!chunk)
+                return _libssh2_error(session, LIBSSH2_ERROR_ALLOC,
+                                      "malloc fail for FXP_WRITE");
 
-        s = chunk->packet;
-        _libssh2_store_u32(&s, packet_len - 4);
+            chunk->len = size;
+            chunk->sent = 0;
+            chunk->lefttosend = packet_len;
 
-        *(s++) = SSH_FXP_WRITE;
-        request_id = sftp->request_id++;
-        chunk->request_id = request_id;
-        _libssh2_store_u32(&s, request_id);
-        _libssh2_store_str(&s, handle->handle, handle->handle_len);
-        _libssh2_store_u64(&s, handle->u.file.offset_sent);
-        handle->u.file.offset_sent += size; /* advance offset at once */
-        _libssh2_store_str(&s, buffer, size);
+            s = chunk->packet;
+            _libssh2_store_u32(&s, packet_len - 4);
 
-        /* add this new entry LAST in the list */
-        _libssh2_list_add(&handle->packet_list, &chunk->node);
+            *(s++) = SSH_FXP_WRITE;
+            request_id = sftp->request_id++;
+            chunk->request_id = request_id;
+            _libssh2_store_u32(&s, request_id);
+            _libssh2_store_str(&s, handle->handle, handle->handle_len);
+            _libssh2_store_u64(&s, handle->u.file.offset_sent);
+            handle->u.file.offset_sent += size; /* advance offset at once */
+            _libssh2_store_str(&s, buffer, size);
 
-        buffer += size;
-        count -= size; /* deduct the size we used, as we might have
-                          to create more packets */
-    }
+            /* add this new entry LAST in the list */
+            _libssh2_list_add(&handle->packet_list, &chunk->node);
 
-    /* move through the WRITE packets that haven't been sent and send as many
-       as possible - remember that we don't block */
-    chunk = _libssh2_list_first(&handle->packet_list);
+            buffer += size;
+            count -= size; /* deduct the size we used, as we might have
+                              to create more packets */
+        }
 
-    while(chunk) {
-        if(chunk->lefttosend) {
-            rc = _libssh2_channel_write(channel, 0,
-                                        &chunk->packet[chunk->sent],
-                                        chunk->lefttosend);
-            if(rc < 0) {
-                if(rc != LIBSSH2_ERROR_EAGAIN)
-                    /* error */
+        /* move through the WRITE packets that haven't been sent and send as many
+           as possible - remember that we don't block */
+        chunk = _libssh2_list_first(&handle->packet_list);
+
+        while(chunk) {
+            if(chunk->lefttosend) {
+                rc = _libssh2_channel_write(channel, 0,
+                                            &chunk->packet[chunk->sent],
+                                            chunk->lefttosend);
+                if(rc < 0)
+                    /* remain in idle state */
                     return rc;
-                eagain++;
-                break;
+
+                /* remember where to continue sending the next time */
+                chunk->lefttosend -= rc;
+                chunk->sent += rc;
+
+                if(chunk->lefttosend)
+                    /* data left to send, get out of loop */
+                    break;
             }
 
-            /* remember where to continue sending the next time */
-            chunk->lefttosend -= rc;
-            chunk->sent += rc;
+            /* move on to the next chunk with data to send */
+            chunk = _libssh2_list_next(&chunk->node);
+        }
 
+        /* fall-through */
+    case libssh2_NB_state_sent:
+
+        sftp->write_state = libssh2_NB_state_idle;
+        /*
+         * Count all ACKed packets
+         */
+        chunk = _libssh2_list_first(&handle->packet_list);
+
+        while(chunk) {
             if(chunk->lefttosend)
-                /* data left to send, get out of loop */
+                /* if the chunk still has data left to send, we shouldn't wait
+                   for an ACK for it just yet */
                 break;
+
+            else if(acked)
+                /* if we have sent data that is acked, we must return that
+                   info before we call a function that might return EAGAIN */
+                break;
+
+            /* we check the packets in order */
+            rc = sftp_packet_require(sftp, SSH_FXP_STATUS,
+                                     chunk->request_id, &data, &data_len);
+            if (rc < 0) {
+                if (rc == LIBSSH2_ERROR_EAGAIN)
+                    sftp->write_state = libssh2_NB_state_sent;
+                return rc;
+            }
+
+            retcode = _libssh2_ntohu32(data + 5);
+            LIBSSH2_FREE(session, data);
+
+            sftp->last_errno = retcode;
+            if (retcode == LIBSSH2_FX_OK) {
+                acked += chunk->len; /* number of payload data that was acked
+                                        here */
+
+                /* we increase the offset value for all acks */
+                handle->u.file.offset += chunk->len;
+
+                next = _libssh2_list_next(&chunk->node);
+
+                _libssh2_list_remove(&chunk->node); /* remove from list */
+                LIBSSH2_FREE(session, chunk); /* free memory */
+
+                chunk = next;
+            }
+            else {
+                /* flush all pending packets from the outgoing list */
+                sftp_packetlist_flush(handle);
+
+                /* since we return error now, the application will not get any
+                   outstanding data acked, so we need to rewind the offset to
+                   where the application knows it has reached with acked data */
+                handle->u.file.offset -= handle->u.file.acked;
+
+                /* then reset the offset_sent to be the same as the offset */
+                handle->u.file.offset_sent = handle->u.file.offset;
+
+                /* clear the acked counter since we can have no pending data to
+                   ack after an error */
+                handle->u.file.acked = 0;
+
+                /* the server returned an error for that written chunk, propagate
+                   this back to our parent function */
+                return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                                      "FXP write failed");
+            }
         }
-
-        /* move on to the next chunk with data to send */
-        chunk = _libssh2_list_next(&chunk->node);
-    }
-
-    /*
-     * Count all ACKed packets
-     */
-    chunk = _libssh2_list_first(&handle->packet_list);
-
-    while(chunk) {
-        if(chunk->lefttosend)
-            /* if the chunk still has data left to send, we shouldn't wait for
-               an ACK for it just yet */
-            break;
-
-        /* we check the packets in order */
-        rc = sftp_packet_require(sftp, SSH_FXP_STATUS,
-                                 chunk->request_id, &data, &data_len);
-        if (rc == LIBSSH2_ERROR_EAGAIN) {
-            eagain++;
-            break;
-        }
-        else if (rc) {
-            return _libssh2_error(session, rc, "Waiting for SFTP status");
-        }
-        retcode = _libssh2_ntohu32(data + 5);
-        LIBSSH2_FREE(session, data);
-
-        sftp->last_errno = retcode;
-        if (retcode == LIBSSH2_FX_OK) {
-            acked += chunk->len; /* number of payload data that was acked
-                                    here */
-
-            /* we increase the offset value for all acks */
-            handle->u.file.offset += chunk->len;
-
-            next = _libssh2_list_next(&chunk->node);
-
-            _libssh2_list_remove(&chunk->node); /* remove from list */
-            LIBSSH2_FREE(session, chunk); /* free memory */
-
-            chunk = next;
-        }
-        else {
-            /* flush all pending packets from the outgoing list */
-            sftp_packetlist_flush(handle);
-
-            /* since we return error now, the applicaton will not get any
-               outstanding data acked, so we need to rewind the offset to
-               where the application knows it has reached with acked data */
-            handle->u.file.offset -= handle->u.file.acked;
-
-            /* then reset the offset_sent to be the same as the offset */
-            handle->u.file.offset_sent = handle->u.file.offset;
-
-            /* clear the acked counter since we can have no pending data to
-               ack after an error */
-            handle->u.file.acked = 0;
-
-            /* the server returned an error for that written chunk, propagate
-               this back to our parent function */
-            return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
-                                  "FXP write failed");
-        }
+        break;
     }
 
     /* if there were acked data in a previous call that wasn't returned then,
@@ -1781,9 +2048,7 @@ static ssize_t sftp_write(LIBSSH2_SFTP_HANDLE *handle, const char *buffer,
 
         return ret;
     }
-    else if(eagain)
-        return _libssh2_error(session, LIBSSH2_ERROR_EAGAIN,
-                              "Would block sftp_write");
+
     else
         return 0; /* nothing was acked, and no EAGAIN was received! */
 }
@@ -1803,6 +2068,99 @@ libssh2_sftp_write(LIBSSH2_SFTP_HANDLE *hnd, const char *buffer,
     return rc;
 
 }
+
+static int sftp_fsync(LIBSSH2_SFTP_HANDLE *handle)
+{
+    LIBSSH2_SFTP *sftp = handle->sftp;
+    LIBSSH2_CHANNEL *channel = sftp->channel;
+    LIBSSH2_SESSION *session = channel->session;
+    /* 34 = packet_len(4) + packet_type(1) + request_id(4) +
+       string_len(4) + strlen("fsync@openssh.com")(17) + handle_len(4) */
+    uint32_t packet_len = handle->handle_len + 34;
+    size_t data_len;
+    unsigned char *packet, *s, *data;
+    ssize_t rc;
+    uint32_t retcode;
+
+    if (sftp->fsync_state == libssh2_NB_state_idle) {
+        _libssh2_debug(session, LIBSSH2_TRACE_SFTP,
+                       "Issuing fsync command");
+        s = packet = LIBSSH2_ALLOC(session, packet_len);
+        if (!packet) {
+            return _libssh2_error(session, LIBSSH2_ERROR_ALLOC,
+                                  "Unable to allocate memory for FXP_EXTENDED "
+                                  "packet");
+        }
+
+        _libssh2_store_u32(&s, packet_len - 4);
+        *(s++) = SSH_FXP_EXTENDED;
+        sftp->fsync_request_id = sftp->request_id++;
+        _libssh2_store_u32(&s, sftp->fsync_request_id);
+        _libssh2_store_str(&s, "fsync@openssh.com", 17);
+        _libssh2_store_str(&s, handle->handle, handle->handle_len);
+
+        sftp->fsync_state = libssh2_NB_state_created;
+    } else {
+        packet = sftp->fsync_packet;
+    }
+
+    if (sftp->fsync_state == libssh2_NB_state_created) {
+        rc = _libssh2_channel_write(channel, 0, packet, packet_len);
+        if (rc == LIBSSH2_ERROR_EAGAIN ||
+            (0 <= rc && rc < (ssize_t)packet_len)) {
+            sftp->fsync_packet = packet;
+            return LIBSSH2_ERROR_EAGAIN;
+        }
+
+        LIBSSH2_FREE(session, packet);
+        sftp->fsync_packet = NULL;
+
+        if (rc < 0) {
+            sftp->fsync_state = libssh2_NB_state_idle;
+            return _libssh2_error(session, LIBSSH2_ERROR_SOCKET_SEND,
+                                  "_libssh2_channel_write() failed");
+        }
+        sftp->fsync_state = libssh2_NB_state_sent;
+    }
+
+    rc = sftp_packet_require(sftp, SSH_FXP_STATUS,
+                             sftp->fsync_request_id, &data, &data_len);
+    if (rc == LIBSSH2_ERROR_EAGAIN) {
+        return rc;
+    } else if (rc) {
+        sftp->fsync_state = libssh2_NB_state_idle;
+        return _libssh2_error(session, rc,
+                              "Error waiting for FXP EXTENDED REPLY");
+    }
+
+    sftp->fsync_state = libssh2_NB_state_idle;
+
+    retcode = _libssh2_ntohu32(data + 5);
+    LIBSSH2_FREE(session, data);
+
+    if (retcode != LIBSSH2_FX_OK) {
+        sftp->last_errno = retcode;
+        return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                              "fsync failed");
+    }
+
+    return 0;
+}
+
+/* libssh2_sftp_fsync
+ * Commit data on the handle to disk.
+ */
+LIBSSH2_API int
+libssh2_sftp_fsync(LIBSSH2_SFTP_HANDLE *hnd)
+{
+    int rc;
+    if(!hnd)
+        return LIBSSH2_ERROR_BAD_USE;
+    BLOCK_ADJUST(rc, hnd->sftp->channel->session,
+                 sftp_fsync(hnd));
+    return rc;
+}
+
 
 /*
  * sftp_fstat
@@ -1870,11 +2228,11 @@ static int sftp_fstat(LIBSSH2_SFTP_HANDLE *handle,
     rc = sftp_packet_requirev(sftp, 2, fstat_responses,
                               sftp->fstat_request_id, &data,
                               &data_len);
-    if (rc == LIBSSH2_ERROR_EAGAIN) {
+    if (rc == LIBSSH2_ERROR_EAGAIN)
         return rc;
-    } else if (rc) {
+    else if (rc) {
         sftp->fstat_state = libssh2_NB_state_idle;
-        return _libssh2_error(session, LIBSSH2_ERROR_SOCKET_TIMEOUT,
+        return _libssh2_error(session, rc,
                               "Timeout waiting for status message");
     }
 
@@ -1922,21 +2280,24 @@ libssh2_sftp_fstat_ex(LIBSSH2_SFTP_HANDLE *hnd,
 LIBSSH2_API void
 libssh2_sftp_seek64(LIBSSH2_SFTP_HANDLE *handle, libssh2_uint64_t offset)
 {
-    if(handle) {
-        handle->u.file.offset = handle->u.file.offset_sent = offset;
-        /* discard all pending requests and currently read data */
-        sftp_packetlist_flush(handle);
+    if(!handle)
+        return;
+    if(handle->u.file.offset == offset && handle->u.file.offset_sent == offset)
+        return;
 
-        /* free the left received buffered data */
-        if (handle->u.file.data_left) {
-            LIBSSH2_FREE(handle->sftp->channel->session, handle->u.file.data);
-            handle->u.file.data_left = handle->u.file.data_len = 0;
-            handle->u.file.data = NULL;
-        }
+    handle->u.file.offset = handle->u.file.offset_sent = offset;
+    /* discard all pending requests and currently read data */
+    sftp_packetlist_flush(handle);
 
-        /* reset EOF to False */
-        handle->u.file.eof = FALSE;
+    /* free the left received buffered data */
+    if (handle->u.file.data_left) {
+        LIBSSH2_FREE(handle->sftp->channel->session, handle->u.file.data);
+        handle->u.file.data_left = handle->u.file.data_len = 0;
+        handle->u.file.data = NULL;
     }
+
+    /* reset EOF to False */
+    handle->u.file.eof = FALSE;
 }
 
 /* libssh2_sftp_seek
@@ -1976,13 +2337,15 @@ libssh2_sftp_tell64(LIBSSH2_SFTP_HANDLE *handle)
 }
 
 /*
- * Flush all remaining incoming SFTP packets.
+ * Flush all remaining incoming SFTP packets and zombies.
  */
 static void sftp_packet_flush(LIBSSH2_SFTP *sftp)
 {
     LIBSSH2_CHANNEL *channel = sftp->channel;
     LIBSSH2_SESSION *session = channel->session;
     LIBSSH2_SFTP_PACKET *packet = _libssh2_list_first(&sftp->packets);
+    struct sftp_zombie_requests *zombie =
+        _libssh2_list_first(&sftp->zombie_requests);
 
     while(packet) {
         LIBSSH2_SFTP_PACKET *next;
@@ -1996,12 +2359,25 @@ static void sftp_packet_flush(LIBSSH2_SFTP *sftp)
         packet = next;
     }
 
+    while(zombie) {
+        /* figure out the next node */
+        struct sftp_zombie_requests *next = _libssh2_list_next(&zombie->node);
+        /* unlink the current one */
+        _libssh2_list_remove(&zombie->node);
+        /* free the memory */
+        LIBSSH2_FREE(session, zombie);
+        zombie = next;
+    }
+
 }
 
 /* sftp_close_handle
  *
- * Close a file or directory handle
- * Also frees handle resource and unlinks it from the SFTP structure
+ * Close a file or directory handle.
+ * Also frees handle resource and unlinks it from the SFTP structure.
+ * The handle is no longer usable after return of this function, unless
+ * the return value is LIBSSH2_ERROR_EAGAIN in which case this function
+ * should be called again.
  */
 static int
 sftp_close_handle(LIBSSH2_SFTP_HANDLE *handle)
@@ -2010,27 +2386,28 @@ sftp_close_handle(LIBSSH2_SFTP_HANDLE *handle)
     LIBSSH2_CHANNEL *channel = sftp->channel;
     LIBSSH2_SESSION *session = channel->session;
     size_t data_len;
-    int retcode;
     /* 13 = packet_len(4) + packet_type(1) + request_id(4) + handle_len(4) */
     uint32_t packet_len = handle->handle_len + 13;
     unsigned char *s, *data = NULL;
-    int rc;
+    int rc = 0;
 
     if (handle->close_state == libssh2_NB_state_idle) {
         _libssh2_debug(session, LIBSSH2_TRACE_SFTP, "Closing handle");
         s = handle->close_packet = LIBSSH2_ALLOC(session, packet_len);
         if (!handle->close_packet) {
-            return _libssh2_error(session, LIBSSH2_ERROR_ALLOC,
-                                  "Unable to allocate memory for FXP_CLOSE "
-                                  "packet");
-        }
+            handle->close_state = libssh2_NB_state_idle;
+            rc = _libssh2_error(session, LIBSSH2_ERROR_ALLOC,
+                                "Unable to allocate memory for FXP_CLOSE "
+                                "packet");
+        } else {
 
-        _libssh2_store_u32(&s, packet_len - 4);
-        *(s++) = SSH_FXP_CLOSE;
-        handle->close_request_id = sftp->request_id++;
-        _libssh2_store_u32(&s, handle->close_request_id);
-        _libssh2_store_str(&s, handle->handle, handle->handle_len);
-        handle->close_state = libssh2_NB_state_created;
+            _libssh2_store_u32(&s, packet_len - 4);
+            *(s++) = SSH_FXP_CLOSE;
+            handle->close_request_id = sftp->request_id++;
+            _libssh2_store_u32(&s, handle->close_request_id);
+            _libssh2_store_str(&s, handle->handle, handle->handle_len);
+            handle->close_state = libssh2_NB_state_created;
+        }
     }
 
     if (handle->close_state == libssh2_NB_state_created) {
@@ -2039,16 +2416,14 @@ sftp_close_handle(LIBSSH2_SFTP_HANDLE *handle)
         if (rc == LIBSSH2_ERROR_EAGAIN) {
             return rc;
         } else if ((ssize_t)packet_len != rc) {
-            LIBSSH2_FREE(session, handle->close_packet);
-            handle->close_packet = NULL;
             handle->close_state = libssh2_NB_state_idle;
-            return _libssh2_error(session, LIBSSH2_ERROR_SOCKET_SEND,
-                                  "Unable to send FXP_CLOSE command");
-        }
+            rc = _libssh2_error(session, LIBSSH2_ERROR_SOCKET_SEND,
+                                "Unable to send FXP_CLOSE command");
+        } else
+            handle->close_state = libssh2_NB_state_sent;
+
         LIBSSH2_FREE(session, handle->close_packet);
         handle->close_packet = NULL;
-
-        handle->close_state = libssh2_NB_state_sent;
     }
 
     if (handle->close_state == libssh2_NB_state_sent) {
@@ -2057,29 +2432,30 @@ sftp_close_handle(LIBSSH2_SFTP_HANDLE *handle)
                                  &data_len);
         if (rc == LIBSSH2_ERROR_EAGAIN) {
             return rc;
+
         } else if (rc) {
-            handle->close_state = libssh2_NB_state_idle;
-            return _libssh2_error(session, LIBSSH2_ERROR_SOCKET_TIMEOUT,
-                                  "Timeout waiting for status message");
+            _libssh2_error(session, rc,
+                           "Error waiting for status message");
         }
 
         handle->close_state = libssh2_NB_state_sent1;
     }
 
-    if(!data)
+    if(!data) {
         /* if it reaches this point with data unset, something unwanted
-           happened (like this function is called again when in
-           libssh2_NB_state_sent1 state) and we just bail out */
-        return LIBSSH2_ERROR_INVAL;
+           happened for which we should have set an error code */
+        assert(rc);
 
-    retcode = _libssh2_ntohu32(data + 5);
-    LIBSSH2_FREE(session, data);
+    } else {
+        int retcode = _libssh2_ntohu32(data + 5);
+        LIBSSH2_FREE(session, data);
 
-    if (retcode != LIBSSH2_FX_OK) {
-        sftp->last_errno = retcode;
-        handle->close_state = libssh2_NB_state_idle;
-        return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
-                              "SFTP Protocol Error");
+        if (retcode != LIBSSH2_FX_OK) {
+            sftp->last_errno = retcode;
+            handle->close_state = libssh2_NB_state_idle;
+            rc = _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                                "SFTP Protocol Error");
+        }
     }
 
     /* remove this handle from the parent's list */
@@ -2101,7 +2477,7 @@ sftp_close_handle(LIBSSH2_SFTP_HANDLE *handle)
 
     LIBSSH2_FREE(session, handle);
 
-    return 0;
+    return rc;
 }
 
 /* libssh2_sftp_close_handle
@@ -2177,8 +2553,8 @@ static int sftp_unlink(LIBSSH2_SFTP *sftp, const char *filename,
     }
     else if (rc) {
         sftp->unlink_state = libssh2_NB_state_idle;
-        return _libssh2_error(session, LIBSSH2_ERROR_SOCKET_TIMEOUT,
-                              "Timeout waiting for status message");
+        return _libssh2_error(session, rc,
+                              "Error waiting for FXP STATUS");
     }
 
     sftp->unlink_state = libssh2_NB_state_idle;
@@ -2287,8 +2663,8 @@ static int sftp_rename(LIBSSH2_SFTP *sftp, const char *source_filename,
         return rc;
     } else if (rc) {
         sftp->rename_state = libssh2_NB_state_idle;
-        return _libssh2_error(session, LIBSSH2_ERROR_SOCKET_TIMEOUT,
-                              "Timeout waiting for status message");
+        return _libssh2_error(session, rc,
+                              "Error waiting for FXP STATUS");
     }
 
     sftp->rename_state = libssh2_NB_state_idle;
@@ -2355,12 +2731,14 @@ static int sftp_fstatvfs(LIBSSH2_SFTP_HANDLE *handle, LIBSSH2_SFTP_STATVFS *st)
     LIBSSH2_SESSION *session = channel->session;
     size_t data_len;
     /* 17 = packet_len(4) + packet_type(1) + request_id(4) + ext_len(4)
-          + handle_len (4) */
+       + handle_len (4) */
     /* 20 = strlen ("fstatvfs@openssh.com") */
     uint32_t packet_len = handle->handle_len + 20 + 17;
     unsigned char *packet, *s, *data;
     ssize_t rc;
     unsigned int flag;
+    static const unsigned char responses[2] =
+        { SSH_FXP_EXTENDED_REPLY, SSH_FXP_STATUS };
 
     if (sftp->fstatvfs_state == libssh2_NB_state_idle) {
         _libssh2_debug(session, LIBSSH2_TRACE_SFTP,
@@ -2404,15 +2782,27 @@ static int sftp_fstatvfs(LIBSSH2_SFTP_HANDLE *handle, LIBSSH2_SFTP_STATVFS *st)
         sftp->fstatvfs_state = libssh2_NB_state_sent;
     }
 
-    rc = sftp_packet_require(sftp, SSH_FXP_EXTENDED_REPLY,
-                             sftp->fstatvfs_request_id, &data, &data_len);
+    rc = sftp_packet_requirev(sftp, 2, responses, sftp->fstatvfs_request_id,
+                              &data, &data_len);
+
     if (rc == LIBSSH2_ERROR_EAGAIN) {
         return rc;
     } else if (rc) {
         sftp->fstatvfs_state = libssh2_NB_state_idle;
-        return _libssh2_error(session, LIBSSH2_ERROR_SOCKET_TIMEOUT,
-                              "Timeout waiting for status message");
-    } else if (data_len < 93) {
+        return _libssh2_error(session, rc,
+                              "Error waiting for FXP EXTENDED REPLY");
+    }
+
+    if (data[0] == SSH_FXP_STATUS) {
+        int retcode = _libssh2_ntohu32(data + 5);
+        sftp->fstatvfs_state = libssh2_NB_state_idle;
+        LIBSSH2_FREE(session, data);
+        sftp->last_errno = retcode;
+        return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                              "SFTP Protocol Error");
+    }
+
+    if (data_len < 93) {
         LIBSSH2_FREE(session, data);
         sftp->fstatvfs_state = libssh2_NB_state_idle;
         return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
@@ -2430,13 +2820,13 @@ static int sftp_fstatvfs(LIBSSH2_SFTP_HANDLE *handle, LIBSSH2_SFTP_STATVFS *st)
     st->f_ffree = _libssh2_ntohu64(data + 53);
     st->f_favail = _libssh2_ntohu64(data + 61);
     st->f_fsid = _libssh2_ntohu64(data + 69);
-    flag = _libssh2_ntohu64(data + 77);
+    flag = (unsigned int)_libssh2_ntohu64(data + 77);
     st->f_namemax = _libssh2_ntohu64(data + 85);
 
     st->f_flag = (flag & SSH_FXE_STATVFS_ST_RDONLY)
-                  ? LIBSSH2_SFTP_ST_RDONLY : 0;
+        ? LIBSSH2_SFTP_ST_RDONLY : 0;
     st->f_flag |= (flag & SSH_FXE_STATVFS_ST_NOSUID)
-                  ? LIBSSH2_SFTP_ST_NOSUID : 0;
+        ? LIBSSH2_SFTP_ST_NOSUID : 0;
 
     LIBSSH2_FREE(session, data);
     return 0;
@@ -2468,12 +2858,14 @@ static int sftp_statvfs(LIBSSH2_SFTP *sftp, const char *path,
     LIBSSH2_SESSION *session = channel->session;
     size_t data_len;
     /* 17 = packet_len(4) + packet_type(1) + request_id(4) + ext_len(4)
-          + path_len (4) */
+       + path_len (4) */
     /* 19 = strlen ("statvfs@openssh.com") */
     uint32_t packet_len = path_len + 19 + 17;
     unsigned char *packet, *s, *data;
     ssize_t rc;
     unsigned int flag;
+    static const unsigned char responses[2] =
+        { SSH_FXP_EXTENDED_REPLY, SSH_FXP_STATUS };
 
     if (sftp->statvfs_state == libssh2_NB_state_idle) {
         _libssh2_debug(session, LIBSSH2_TRACE_SFTP,
@@ -2517,17 +2909,28 @@ static int sftp_statvfs(LIBSSH2_SFTP *sftp, const char *path,
         sftp->statvfs_state = libssh2_NB_state_sent;
     }
 
-    rc = sftp_packet_require(sftp, SSH_FXP_EXTENDED_REPLY,
-                             sftp->statvfs_request_id, &data, &data_len);
+    rc = sftp_packet_requirev(sftp, 2, responses, sftp->statvfs_request_id,
+                              &data, &data_len);
     if (rc == LIBSSH2_ERROR_EAGAIN) {
         return rc;
     } else if (rc) {
         sftp->statvfs_state = libssh2_NB_state_idle;
-        return _libssh2_error(session, LIBSSH2_ERROR_SOCKET_TIMEOUT,
-                              "Timeout waiting for status message");
-    } else if (data_len < 93) {
+        return _libssh2_error(session, rc,
+                              "Error waiting for FXP EXTENDED REPLY");
+    }
+
+    if (data[0] == SSH_FXP_STATUS) {
+        int retcode = _libssh2_ntohu32(data + 5);
+        sftp->statvfs_state = libssh2_NB_state_idle;
         LIBSSH2_FREE(session, data);
-        sftp->fstatvfs_state = libssh2_NB_state_idle;
+        sftp->last_errno = retcode;
+        return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                              "SFTP Protocol Error");
+    }
+
+    if (data_len < 93) {
+        LIBSSH2_FREE(session, data);
+        sftp->statvfs_state = libssh2_NB_state_idle;
         return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
                               "SFTP Protocol Error: short response");
     }
@@ -2543,13 +2946,13 @@ static int sftp_statvfs(LIBSSH2_SFTP *sftp, const char *path,
     st->f_ffree = _libssh2_ntohu64(data + 53);
     st->f_favail = _libssh2_ntohu64(data + 61);
     st->f_fsid = _libssh2_ntohu64(data + 69);
-    flag = _libssh2_ntohu64(data + 77);
+    flag = (unsigned int)_libssh2_ntohu64(data + 77);
     st->f_namemax = _libssh2_ntohu64(data + 85);
 
     st->f_flag = (flag & SSH_FXE_STATVFS_ST_RDONLY)
-                  ? LIBSSH2_SFTP_ST_RDONLY : 0;
+        ? LIBSSH2_SFTP_ST_RDONLY : 0;
     st->f_flag |= (flag & SSH_FXE_STATVFS_ST_NOSUID)
-                  ? LIBSSH2_SFTP_ST_NOSUID : 0;
+        ? LIBSSH2_SFTP_ST_NOSUID : 0;
 
     LIBSSH2_FREE(session, data);
     return 0;
@@ -2642,8 +3045,8 @@ static int sftp_mkdir(LIBSSH2_SFTP *sftp, const char *path,
         return rc;
     } else if (rc) {
         sftp->mkdir_state = libssh2_NB_state_idle;
-        return _libssh2_error(session, LIBSSH2_ERROR_SOCKET_TIMEOUT,
-                              "Timeout waiting for status message");
+        return _libssh2_error(session, rc,
+                              "Error waiting for FXP STATUS");
     }
 
     sftp->mkdir_state = libssh2_NB_state_idle;
@@ -2736,8 +3139,8 @@ static int sftp_rmdir(LIBSSH2_SFTP *sftp, const char *path,
         return rc;
     } else if (rc) {
         sftp->rmdir_state = libssh2_NB_state_idle;
-        return _libssh2_error(session, LIBSSH2_ERROR_SOCKET_TIMEOUT,
-                              "Timeout waiting for status message");
+        return _libssh2_error(session, rc,
+                              "Error waiting for FXP STATUS");
     }
 
     sftp->rmdir_state = libssh2_NB_state_idle;
@@ -2845,11 +3248,11 @@ static int sftp_stat(LIBSSH2_SFTP *sftp, const char *path,
 
     rc = sftp_packet_requirev(sftp, 2, stat_responses,
                               sftp->stat_request_id, &data, &data_len);
-    if (rc == LIBSSH2_ERROR_EAGAIN) {
+    if (rc == LIBSSH2_ERROR_EAGAIN)
         return rc;
-    } else if (rc) {
+    else if (rc) {
         sftp->stat_state = libssh2_NB_state_idle;
-        return _libssh2_error(session, LIBSSH2_ERROR_SOCKET_TIMEOUT,
+        return _libssh2_error(session, rc,
                               "Timeout waiting for status message");
     }
 
@@ -2980,8 +3383,8 @@ static int sftp_symlink(LIBSSH2_SFTP *sftp, const char *path,
         return retcode;
     else if (retcode) {
         sftp->symlink_state = libssh2_NB_state_idle;
-        return _libssh2_error(session, LIBSSH2_ERROR_SOCKET_TIMEOUT,
-                              "Timeout waiting for status message");
+        return _libssh2_error(session, retcode,
+                              "Error waiting for status message");
     }
 
     sftp->symlink_state = libssh2_NB_state_idle;
@@ -3045,7 +3448,7 @@ LIBSSH2_API unsigned long
 libssh2_sftp_last_error(LIBSSH2_SFTP *sftp)
 {
     if(!sftp)
-       return 0;
+        return 0;
 
     return sftp->last_errno;
 }

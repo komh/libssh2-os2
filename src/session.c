@@ -1,5 +1,5 @@
 /* Copyright (c) 2004-2007 Sara Golemon <sarag@libssh2.org>
- * Copyright (c) 2009-2011 by Daniel Stenberg
+ * Copyright (c) 2009-2015 by Daniel Stenberg
  * Copyright (c) 2010 Simon Josefsson <simon@josefsson.org>
  * All rights reserved.
  *
@@ -143,7 +143,7 @@ banner_receive(LIBSSH2_SESSION * session)
 
         if (ret == 0) {
             session->socket_state = LIBSSH2_SOCKET_DISCONNECTED;
-            return LIBSSH2_ERROR_SOCKET_RECV;
+            return LIBSSH2_ERROR_SOCKET_DISCONNECT;
         }
 
         if (c == '\0') {
@@ -599,12 +599,12 @@ int _libssh2_wait_socket(LIBSSH2_SESSION *session, time_t start_time)
 
     if (session->api_timeout > 0 &&
         (seconds_to_next == 0 ||
-         seconds_to_next > session->api_timeout)) {
+         ms_to_next > session->api_timeout)) {
         time_t now = time (NULL);
-        elapsed_ms = (long)(1000*difftime(start_time, now));
+        elapsed_ms = (long)(1000*difftime(now, start_time));
         if (elapsed_ms > session->api_timeout) {
-            session->err_code = LIBSSH2_ERROR_TIMEOUT;
-            return LIBSSH2_ERROR_TIMEOUT;
+            return _libssh2_error(session, LIBSSH2_ERROR_TIMEOUT,
+                                  "API timeout expired");
         }
         ms_to_next = (session->api_timeout - elapsed_ms);
         has_timeout = 1;
@@ -658,10 +658,13 @@ int _libssh2_wait_socket(LIBSSH2_SESSION *session, time_t start_time)
                     has_timeout ? &tv : NULL);
     }
 #endif
-    if(rc <= 0) {
-        /* timeout (or error), bail out with a timeout error */
-        session->err_code = LIBSSH2_ERROR_TIMEOUT;
-        return LIBSSH2_ERROR_TIMEOUT;
+    if(rc == 0) {
+        return _libssh2_error(session, LIBSSH2_ERROR_TIMEOUT,
+                              "Timed out waiting on socket");
+    }
+    if(rc < 0) {
+        return _libssh2_error(session, LIBSSH2_ERROR_TIMEOUT,
+                              "Error waiting on socket");
     }
 
     return 0; /* ready to try again */
@@ -675,7 +678,7 @@ session_startup(LIBSSH2_SESSION *session, libssh2_socket_t sock)
     if (session->startup_state == libssh2_NB_state_idle) {
         _libssh2_debug(session, LIBSSH2_TRACE_TRANS,
                        "session_startup for socket %d", sock);
-        if (INVALID_SOCKET == sock) {
+        if (LIBSSH2_INVALID_SOCKET == sock) {
             /* Did we forget something? */
             return _libssh2_error(session, LIBSSH2_ERROR_BAD_SOCKET,
                                   "Bad socket provided");
@@ -686,8 +689,13 @@ session_startup(LIBSSH2_SESSION *session, libssh2_socket_t sock)
             !get_socket_nonblocking(session->socket_fd);
 
         if (session->socket_prev_blockstate) {
-            /* If in blocking state chang to non-blocking */
-            session_nonblock(session->socket_fd, 1);
+            /* If in blocking state change to non-blocking */
+            rc = session_nonblock(session->socket_fd, 1);
+            if (rc) {
+                return _libssh2_error(session, rc,
+                                      "Failed changing socket's "
+                                      "blocking state to non-blocking");
+            }
         }
 
         session->startup_state = libssh2_NB_state_created;
@@ -828,12 +836,13 @@ session_free(LIBSSH2_SESSION *session)
     LIBSSH2_PACKET *pkg;
     LIBSSH2_CHANNEL *ch;
     LIBSSH2_LISTENER *l;
+    int packets_left = 0;
 
     if (session->free_state == libssh2_NB_state_idle) {
         _libssh2_debug(session, LIBSSH2_TRACE_TRANS, "Freeing session resource",
                        session->remote.banner);
 
-        session->state = libssh2_NB_state_created;
+        session->free_state = libssh2_NB_state_created;
     }
 
     if (session->free_state == libssh2_NB_state_created) {
@@ -844,17 +853,17 @@ session_free(LIBSSH2_SESSION *session)
                 return rc;
         }
 
-        session->state = libssh2_NB_state_sent;
+        session->free_state = libssh2_NB_state_sent;
     }
 
-    if (session->state == libssh2_NB_state_sent) {
+    if (session->free_state == libssh2_NB_state_sent) {
         while ((l = _libssh2_list_first(&session->listeners))) {
             rc = _libssh2_channel_forward_cancel(l);
             if (rc == LIBSSH2_ERROR_EAGAIN)
                 return rc;
         }
 
-        session->state = libssh2_NB_state_sent1;
+        session->free_state = libssh2_NB_state_sent1;
     }
 
     if (session->state & LIBSSH2_STATE_NEWKEYS) {
@@ -1015,9 +1024,20 @@ session_free(LIBSSH2_SESSION *session)
     if (session->scpSend_command) {
         LIBSSH2_FREE(session, session->scpSend_command);
     }
+    if (session->sftpInit_sftp) {
+        LIBSSH2_FREE(session, session->sftpInit_sftp);
+    }
+
+    /* Free payload buffer */
+    if (session->packet.total_num) {
+        LIBSSH2_FREE(session, session->packet.payload);
+    }
 
     /* Cleanup all remaining packets */
     while ((pkg = _libssh2_list_first(&session->packets))) {
+        packets_left++;
+        _libssh2_debug(session, LIBSSH2_TRACE_TRANS,
+            "packet left with id %d", pkg->data[0]);
         /* unlink the node */
         _libssh2_list_remove(&pkg->node);
 
@@ -1025,13 +1045,25 @@ session_free(LIBSSH2_SESSION *session)
         LIBSSH2_FREE(session, pkg->data);
         LIBSSH2_FREE(session, pkg);
     }
+    _libssh2_debug(session, LIBSSH2_TRACE_TRANS,
+         "Extra packets left %d", packets_left);
 
-    if(session->socket_prev_blockstate)
+    if(session->socket_prev_blockstate) {
         /* if the socket was previously blocking, put it back so */
-        session_nonblock(session->socket_fd, 0);
+        rc = session_nonblock(session->socket_fd, 0);
+        if (rc) {
+            _libssh2_debug(session, LIBSSH2_TRACE_TRANS,
+             "unable to reset socket's blocking state");
+        }
+    }
 
     if (session->server_hostkey) {
         LIBSSH2_FREE(session, session->server_hostkey);
+    }
+
+    /* error string */
+    if (session->err_msg && ((session->err_flags & LIBSSH2_ERR_FLAG_DUP) != 0)) {
+        LIBSSH2_FREE(session, (char *)session->err_msg);
     }
 
     LIBSSH2_FREE(session, session);
@@ -1261,7 +1293,24 @@ libssh2_session_last_errno(LIBSSH2_SESSION * session)
     return session->err_code;
 }
 
-/* libssh2_session_flag
+/* libssh2_session_set_last_error
+ *
+ * Sets the internal error code for the session.
+ *
+ * This function is available specifically to be used by high level
+ * language wrappers (i.e. Python or Perl) that may extend the library
+ * features while still relying on its error reporting mechanism.
+ */
+LIBSSH2_API int
+libssh2_session_set_last_error(LIBSSH2_SESSION* session,
+                               int errcode,
+                               const char* errmsg)
+{
+    return _libssh2_error_flags(session, errcode, errmsg,
+                                LIBSSH2_ERR_FLAG_DUP);
+}
+
+/* Libssh2_session_flag
  *
  * Set/Get session flags
  *
@@ -1508,7 +1557,7 @@ libssh2_poll(LIBSSH2_POLLFD * fds, unsigned int nfds, long timeout)
     }
 #else
     /* No select() or poll()
-     * no sockets sturcture to setup
+     * no sockets structure to setup
      */
 
     timeout = 0;

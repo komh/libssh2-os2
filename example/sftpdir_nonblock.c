@@ -68,8 +68,13 @@ int main(int argc, char *argv[])
 
 #ifdef WIN32
     WSADATA wsadata;
+    int err;
 
-    WSAStartup(MAKEWORD(2,0), &wsadata);
+    err = WSAStartup(MAKEWORD(2,0), &wsadata);
+    if (err != 0) {
+        fprintf(stderr, "WSAStartup failed with error: %d\n", err);
+        return 1;
+    }
 #endif
 
     if (argc > 1) {
@@ -134,11 +139,11 @@ int main(int argc, char *argv[])
      * user, that's your call
      */
     fingerprint = libssh2_hostkey_hash(session, LIBSSH2_HOSTKEY_HASH_SHA1);
-    printf("Fingerprint: ");
+    fprintf(stderr, "Fingerprint: ");
     for(i = 0; i < 20; i++) {
-        printf("%02X ", (unsigned char)fingerprint[i]);
+        fprintf(stderr, "%02X ", (unsigned char)fingerprint[i]);
     }
-    printf("\n");
+    fprintf(stderr, "\n");
 
     if (auth_pw) {
         /* We could authenticate via password */
@@ -239,7 +244,7 @@ int main(int argc, char *argv[])
 #else
     close(sock);
 #endif
-    printf("all done\n");
+    fprintf(stderr, "all done\n");
 
     libssh2_exit();
 
